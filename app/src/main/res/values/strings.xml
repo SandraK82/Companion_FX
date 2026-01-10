@@ -1,0 +1,73 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">Diabetes Screen Reader</string>
+    <string name="accessibility_service_description">Dieser Dienst liest Diabetes-Daten von anderen Apps ab, um sie anzuzeigen und an Nightscout zu übertragen.</string>
+
+    <!-- Main Screen -->
+    <string name="current_glucose">Aktueller Glukosewert</string>
+    <string name="last_update">Letzte Aktualisierung</string>
+    <string name="trend">Trend</string>
+    <string name="history">Verlauf</string>
+    <string name="settings">Einstellungen</string>
+    <string name="enable_service">Dienst aktivieren</string>
+    <string name="service_status">Service Status</string>
+    <string name="service_running">Läuft</string>
+    <string name="service_stopped">Gestoppt</string>
+
+    <!-- Settings -->
+    <string name="nightscout_settings">Nightscout Einstellungen</string>
+    <string name="nightscout_url">Nightscout URL</string>
+    <string name="nightscout_url_hint">https://your-nightscout.herokuapp.com</string>
+    <string name="nightscout_api_secret">API Secret</string>
+    <string name="nightscout_api_secret_hint">Dein API Secret</string>
+    <string name="test_connection">Verbindung testen</string>
+    <string name="connection_success">Verbindung erfolgreich!</string>
+    <string name="connection_failed">Verbindung fehlgeschlagen</string>
+
+    <string name="reading_settings">Abruf Einstellungen</string>
+    <string name="reading_interval">Abruf-Intervall</string>
+    <string name="target_app">Ziel-App</string>
+    <string name="select_target_app">Ziel-App auswählen</string>
+
+    <string name="display_settings">Anzeige Einstellungen</string>
+    <string name="glucose_unit">Glukose-Einheit</string>
+    <string name="mgdl">mg/dL</string>
+    <string name="mmoll">mmol/L</string>
+    <string name="low_threshold">Unterer Grenzwert</string>
+    <string name="high_threshold">Oberer Grenzwert</string>
+
+    <!-- Widget -->
+    <string name="widget_name">Diabetes Widget</string>
+    <string name="widget_description">Zeigt aktuelle Glukosewerte und Verlaufsgraph</string>
+    <string name="no_data">Keine Daten</string>
+    <string name="ago">vor</string>
+    <string name="minutes_short">min</string>
+    <string name="hours_short">h</string>
+
+    <!-- Trends -->
+    <string name="trend_double_up">↑↑ Stark steigend</string>
+    <string name="trend_single_up">↑ Steigend</string>
+    <string name="trend_forty_five_up">↗ Leicht steigend</string>
+    <string name="trend_flat">→ Stabil</string>
+    <string name="trend_forty_five_down">↘ Leicht fallend</string>
+    <string name="trend_single_down">↓ Fallend</string>
+    <string name="trend_double_down">↓↓ Stark fallend</string>
+    <string name="trend_unknown">? Unbekannt</string>
+
+    <!-- Notifications -->
+    <string name="notification_channel_name">Diabetes Monitoring</string>
+    <string name="notification_channel_description">Benachrichtigungen über Glukosewerte</string>
+    <string name="notification_title">Diabetes Screen Reader aktiv</string>
+    <string name="notification_text">Überwacht Glukosewerte</string>
+
+    <!-- Errors -->
+    <string name="error_no_accessibility_permission">Bitte aktiviere den Accessibility Service in den Einstellungen</string>
+    <string name="error_nightscout_not_configured">Nightscout ist nicht konfiguriert</string>
+    <string name="error_upload_failed">Upload zu Nightscout fehlgeschlagen</string>
+
+    <!-- Actions -->
+    <string name="save">Speichern</string>
+    <string name="cancel">Abbrechen</string>
+    <string name="refresh">Aktualisieren</string>
+    <string name="ok">OK</string>
+</resources>

@@ -1,0 +1,37 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Primary Colors -->
+    <color name="primary">#1976D2</color>
+    <color name="primary_dark">#1565C0</color>
+    <color name="primary_light">#42A5F5</color>
+    <color name="on_primary">#FFFFFF</color>
+
+    <!-- Secondary Colors -->
+    <color name="secondary">#26A69A</color>
+    <color name="secondary_dark">#00897B</color>
+    <color name="on_secondary">#FFFFFF</color>
+
+    <!-- Background -->
+    <color name="background">#FAFAFA</color>
+    <color name="surface">#FFFFFF</color>
+    <color name="on_background">#212121</color>
+    <color name="on_surface">#212121</color>
+
+    <!-- Glucose Range Colors -->
+    <color name="glucose_low">#F44336</color>
+    <color name="glucose_normal">#4CAF50</color>
+    <color name="glucose_high">#FF9800</color>
+    <color name="glucose_very_high">#F44336</color>
+
+    <!-- Graph Colors -->
+    <color name="graph_line">#1976D2</color>
+    <color name="graph_fill">#401976D2</color>
+    <color name="graph_low_zone">#20F44336</color>
+    <color name="graph_high_zone">#20FF9800</color>
+    <color name="graph_normal_zone">#204CAF50</color>
+
+    <!-- Widget Colors -->
+    <color name="widget_background">#FFFFFF</color>
+    <color name="widget_text">#212121</color>
+    <color name="widget_text_secondary">#757575</color>
+</resources>
