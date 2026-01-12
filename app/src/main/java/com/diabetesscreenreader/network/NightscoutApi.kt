@@ -42,6 +42,11 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     // Store last known values for change detection
     private var lastBatteryPercent: Int? = null
     private var lastReservoir: Double? = null
+    
+    // Temp Basal tracking - only upload when rate changes or time expires
+    private var lastBasalRate: Double? = null
+    private var lastBasalUploadTime: Long = 0
+    private val TEMP_BASAL_DURATION_MS = 60 * 60 * 1000L // 60 minutes in milliseconds
 
     // ════════════════════════════════════════════════════════════════════════════
     // Core HTTP Helper - All requests go through here
@@ -193,6 +198,55 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
         return post("treatments", body) { "Treatment uploaded" }
     }
 
+    /**
+     * Upload a Temp Basal treatment to Nightscout
+     * This creates the blue basal line in the Nightscout graph
+     */
+    suspend fun uploadTempBasal(basalRate: Double, timestamp: Long): Result<String> {
+        val treatment = NightscoutTreatment(
+            eventType = "Temp Basal",
+            created_at = isoFormat.format(Date(timestamp)),
+            date = timestamp,
+            duration = 60,  // 60 minutes - will be overwritten by next temp basal
+            absolute = basalRate,
+            rate = basalRate,
+            type = "NORMAL"
+        )
+        return uploadTreatment(treatment)
+    }
+
+    /**
+     * Check if Temp Basal needs to be uploaded (rate changed or time expired)
+     * Only uploads when:
+     * 1. Basal rate is present and different from last upload
+     * 2. OR more than 60 minutes since last upload (to refresh the line)
+     */
+    suspend fun checkAndUploadTempBasal(reading: GlucoseReading): Result<String>? {
+        val currentBasalRate = reading.basalRate ?: return null
+        
+        val now = System.currentTimeMillis()
+        val timeSinceLastUpload = now - lastBasalUploadTime
+        val rateChanged = lastBasalRate == null || 
+                          kotlin.math.abs(currentBasalRate - lastBasalRate!!) > 0.001
+        val timeExpired = timeSinceLastUpload >= TEMP_BASAL_DURATION_MS
+        
+        if (rateChanged || timeExpired) {
+            Log.d(TAG, "Uploading Temp Basal: rate=$currentBasalRate, rateChanged=$rateChanged, timeExpired=$timeExpired")
+            val result = uploadTempBasal(currentBasalRate, reading.timestamp)
+            if (result.isSuccess) {
+                lastBasalRate = currentBasalRate
+                lastBasalUploadTime = now
+                Log.d(TAG, "Temp Basal uploaded successfully")
+            } else {
+                Log.e(TAG, "Temp Basal upload failed: ${result.exceptionOrNull()?.message}")
+            }
+            return result
+        } else {
+            Log.d(TAG, "Skipping Temp Basal upload: no change (rate=$currentBasalRate, lastRate=$lastBasalRate)")
+            return null
+        }
+    }
+
     suspend fun uploadReadingWithExtras(reading: GlucoseReading): Result<String> =
         withContext(Dispatchers.IO) {
             try {
@@ -203,6 +257,10 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
 
                 uploadDeviceStatus(reading)
                 detectAndUploadEvents(reading)
+                
+                // Upload Temp Basal as treatment (for blue basal line in graph)
+                // Only uploads when rate changes or time expires
+                checkAndUploadTempBasal(reading)
 
                 Result.success("Reading, device status, and events uploaded")
             } catch (e: Exception) {

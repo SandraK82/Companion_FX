@@ -216,5 +216,10 @@ data class NightscoutTreatment(
     val units: String? = null,
     val pumpId: Long? = null,
     val pumpType: String? = null,
-    val pumpSerial: String? = null
+    val pumpSerial: String? = null,
+    // Temp Basal fields
+    val duration: Long? = null,        // Duration in minutes
+    val absolute: Double? = null,      // Absolute basal rate in U/h
+    val rate: Double? = null,          // Rate (same as absolute for absolute temp basals)
+    val percent: Double? = null        // Percentage change (for percent-based temp basals)
 )
