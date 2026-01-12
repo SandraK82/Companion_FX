@@ -40,6 +40,11 @@ class DiabetesAccessibilityService : AccessibilityService() {
         private const val BASE_RETRY_DELAY_MS = 60_000L      // 1 minute
         private const val MAX_RETRY_DELAY_MS = 900_000L     // 15 minutes max
 
+        // Watchdog settings for hang detection
+        private const val READING_WATCHDOG_TIMEOUT_MS = 45_000L  // 45 seconds max for entire reading
+        private const val HEALTH_CHECK_INTERVAL_MS = 30_000L    // Check health every 30 seconds
+        private const val STUCK_STATE_THRESHOLD_MS = 60_000L    // Consider stuck if screen on for 60s without completion
+
         @Volatile
         var instance: DiabetesAccessibilityService? = null
             private set
@@ -91,7 +96,15 @@ class DiabetesAccessibilityService : AccessibilityService() {
     private var consecutiveErrors = 0
 
     // Track if we woke the screen (so we can lock it again after reading)
+    @Volatile
     private var didWakeScreen = false
+
+    // Watchdog state for hang detection
+    @Volatile
+    private var isReadingInProgress = false
+    @Volatile
+    private var readingStartTime = 0L
+    private var healthCheckJob: Job? = null
 
     // Track last saved bolus to prevent duplicates (amount, approximate timestamp)
     private var lastSavedBolus: Pair<Double, Long>? = null
@@ -123,6 +136,9 @@ class DiabetesAccessibilityService : AccessibilityService() {
         // Initialize AlarmManager for periodic reading
         setupAlarmManager()
         scheduleNextReading(5000L) // First reading after 5 seconds
+
+        // Start health check watchdog
+        startHealthCheckWatchdog()
     }
 
     /**
@@ -190,6 +206,97 @@ class DiabetesAccessibilityService : AccessibilityService() {
         alarmPendingIntent?.let { pi ->
             alarmManager?.cancel(pi)
             Log.d(TAG, "Alarm cancelled")
+        }
+    }
+
+    /**
+     * Starts a periodic health check watchdog that monitors for stuck states.
+     * This runs independently of the reading cycle to detect and recover from hangs.
+     */
+    private fun startHealthCheckWatchdog() {
+        healthCheckJob?.cancel()
+        healthCheckJob = serviceScope.launch {
+            while (isActive) {
+                delay(HEALTH_CHECK_INTERVAL_MS)
+                performHealthCheck()
+            }
+        }
+        Log.d(TAG, "Health check watchdog started")
+    }
+
+    /**
+     * Performs a health check to detect stuck states.
+     * If a reading is in progress for too long, or the screen is stuck on, triggers recovery.
+     */
+    private suspend fun performHealthCheck() {
+        val currentTime = System.currentTimeMillis()
+
+        // Check if a reading is stuck (taking too long)
+        if (isReadingInProgress && readingStartTime > 0) {
+            val readingDuration = currentTime - readingStartTime
+            if (readingDuration > STUCK_STATE_THRESHOLD_MS) {
+                Log.w(TAG, "WATCHDOG: Reading stuck for ${readingDuration}ms - triggering recovery")
+                performAutoRecovery("reading_timeout")
+                return
+            }
+        }
+
+        // Check if screen was woken but not locked back (stuck in half-awake state)
+        if (didWakeScreen && !isReadingInProgress) {
+            Log.w(TAG, "WATCHDOG: Screen woken but reading not in progress - possible stuck state")
+            performAutoRecovery("stuck_screen")
+            return
+        }
+
+        // Check if screen is on but shouldn't be (we woke it and reading finished long ago)
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+
+        if (powerManager.isInteractive && !keyguardManager.isKeyguardLocked && didWakeScreen) {
+            // Screen is on and unlocked, but we're the ones who woke it
+            // This might be a stuck state if no reading is happening
+            if (!isReadingInProgress) {
+                Log.w(TAG, "WATCHDOG: Screen on and unlocked without active reading - locking")
+                lockScreen()
+                didWakeScreen = false
+            }
+        }
+    }
+
+    /**
+     * Performs automatic recovery from a stuck state.
+     * Resets all state and ensures the screen is locked.
+     */
+    private fun performAutoRecovery(reason: String) {
+        Log.w(TAG, "AUTO-RECOVERY triggered: $reason")
+
+        try {
+            // Reset all state flags
+            isReadingInProgress = false
+            readingStartTime = 0L
+
+            // Lock screen if we woke it
+            if (didWakeScreen) {
+                Log.d(TAG, "AUTO-RECOVERY: Locking screen")
+                lockScreen()
+                didWakeScreen = false
+            }
+
+            // Increment error counter for backoff
+            consecutiveErrors++
+
+            // Schedule next reading with backoff
+            val backoffDelay = min(
+                BASE_RETRY_DELAY_MS * (1 shl min(consecutiveErrors - 1, 4)),
+                MAX_RETRY_DELAY_MS
+            )
+            Log.d(TAG, "AUTO-RECOVERY: Scheduling next reading in ${backoffDelay / 1000}s")
+            scheduleNextReading(backoffDelay)
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error during auto-recovery", e)
+            // Even if recovery fails, try to schedule next reading
+            scheduleNextReading(BASE_RETRY_DELAY_MS)
         }
     }
 
@@ -272,60 +379,69 @@ class DiabetesAccessibilityService : AccessibilityService() {
         val intervalMinutes = app.preferencesManager.readingIntervalMinutes.first()
         val normalDelayMs = intervalMinutes * 60 * 1000L
 
+        // Mark reading as in progress for watchdog
+        isReadingInProgress = true
+        readingStartTime = System.currentTimeMillis()
+
         try {
-            val currentTime = System.currentTimeMillis()
-            val timeSinceLastReading = currentTime - lastReadingTime
+            // Wrap entire reading in timeout to prevent indefinite hangs
+            withTimeout(READING_WATCHDOG_TIMEOUT_MS) {
+                val currentTime = System.currentTimeMillis()
+                val timeSinceLastReading = currentTime - lastReadingTime
 
-            // Safety check: Don't read too frequently
-            if (timeSinceLastReading < 30_000L) { // Minimum 30 seconds between reads
-                Log.d(TAG, "Skipping reading - too soon (${timeSinceLastReading}ms)")
-                scheduleNextReading(normalDelayMs)
-                return
-            }
-
-            Log.d(TAG, "Starting periodic reading...")
-
-            // Check if screen is locked
-            val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
-            val wasLocked = keyguardManager.isKeyguardLocked
-
-            if (wasLocked) {
-                Log.d(TAG, "Screen locked - waking up and unlocking...")
-                didWakeScreen = true
-                startLockscreenReading()
-
-                // Wait for lockscreen to dismiss (max 10 seconds)
-                var waitedMs = 0L
-                while (keyguardManager.isKeyguardLocked && waitedMs < 10_000L) {
-                    delay(500)
-                    waitedMs += 500
+                // Safety check: Don't read too frequently
+                if (timeSinceLastReading < 30_000L) { // Minimum 30 seconds between reads
+                    Log.d(TAG, "Skipping reading - too soon (${timeSinceLastReading}ms)")
+                    return@withTimeout
                 }
 
-                if (keyguardManager.isKeyguardLocked) {
-                    Log.w(TAG, "Screen still locked after 10s - skipping reading")
-                    scheduleNextReading(normalDelayMs)
-                    return
+                Log.d(TAG, "Starting periodic reading...")
+
+                // Check if screen is locked
+                val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
+                val wasLocked = keyguardManager.isKeyguardLocked
+
+                if (wasLocked) {
+                    Log.d(TAG, "Screen locked - waking up and unlocking...")
+                    didWakeScreen = true
+                    startLockscreenReading()
+
+                    // Wait for lockscreen to dismiss (max 10 seconds)
+                    var waitedMs = 0L
+                    while (keyguardManager.isKeyguardLocked && waitedMs < 10_000L) {
+                        delay(500)
+                        waitedMs += 500
+                    }
+
+                    if (keyguardManager.isKeyguardLocked) {
+                        Log.w(TAG, "Screen still locked after 10s - skipping reading")
+                        return@withTimeout
+                    }
+
+                    Log.d(TAG, "Screen unlocked after ${waitedMs}ms - now reading")
+                    delay(1000) // Extra wait for CamAPS FX to be ready
                 }
 
-                Log.d(TAG, "Screen unlocked after ${waitedMs}ms - now reading")
-                delay(1000) // Extra wait for CamAPS FX to be ready
+                // Screen is now unlocked - perform reading
+                Log.d(TAG, "Screen unlocked - reading...")
+                performUnlockedReading()
+
+                // Success - reset error counter
+                consecutiveErrors = 0
             }
 
-            // Screen is now unlocked - perform reading
-            Log.d(TAG, "Screen unlocked - reading...")
-            performUnlockedReading()
-
-            // If we woke the screen, lock it again after reading
-            if (didWakeScreen) {
-                Log.d(TAG, "Locking screen after reading...")
-                delay(1000) // Brief delay before locking
-                lockScreen()
-                didWakeScreen = false
-            }
-
-            // Success - reset error counter and schedule next reading at normal interval
-            consecutiveErrors = 0
+            // Schedule next reading at normal interval
             scheduleNextReading(normalDelayMs)
+
+        } catch (e: TimeoutCancellationException) {
+            Log.e(TAG, "TIMEOUT: Reading took longer than ${READING_WATCHDOG_TIMEOUT_MS}ms", e)
+            consecutiveErrors++
+            val backoffDelay = min(
+                BASE_RETRY_DELAY_MS * (1 shl min(consecutiveErrors - 1, 4)),
+                MAX_RETRY_DELAY_MS
+            )
+            Log.d(TAG, "Scheduling retry in ${backoffDelay / 1000}s (timeout error #$consecutiveErrors)")
+            scheduleNextReading(backoffDelay)
 
         } catch (e: Exception) {
             Log.e(TAG, "Error in periodic reading", e)
@@ -333,11 +449,31 @@ class DiabetesAccessibilityService : AccessibilityService() {
             // Exponential backoff: 1min, 2min, 4min, 8min, 15min (max)
             consecutiveErrors++
             val backoffDelay = min(
-                BASE_RETRY_DELAY_MS * (1 shl (consecutiveErrors - 1)),
+                BASE_RETRY_DELAY_MS * (1 shl min(consecutiveErrors - 1, 4)),
                 MAX_RETRY_DELAY_MS
             )
             Log.d(TAG, "Scheduling retry in ${backoffDelay / 1000}s (error #$consecutiveErrors)")
             scheduleNextReading(backoffDelay)
+
+        } finally {
+            // CRITICAL: Always clean up state, even on error/timeout
+            Log.d(TAG, "Cleaning up reading state...")
+
+            // Lock screen if we woke it (must happen regardless of success/failure)
+            if (didWakeScreen) {
+                Log.d(TAG, "Locking screen after reading (finally block)...")
+                try {
+                    delay(500) // Brief delay before locking
+                    lockScreen()
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error locking screen in finally block", e)
+                }
+                didWakeScreen = false
+            }
+
+            // Reset reading state
+            isReadingInProgress = false
+            readingStartTime = 0L
         }
     }
 
@@ -753,6 +889,10 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
     override fun onDestroy() {
         super.onDestroy()
+
+        // Cancel health check watchdog
+        healthCheckJob?.cancel()
+        healthCheckJob = null
 
         // Cancel pending alarm
         cancelAlarm()
