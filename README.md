@@ -1,3 +1,7 @@
+🌐 **English** | [Deutsch](README.de.md) | [Français](README.fr.md)
+
+> ⚠️ **Warning:** This app should only be used on a dedicated secondary phone in follower mode, as it significantly restricts normal smartphone usage.
+
 # Companion FX
 
 Companion app for CamAPS FX that reads glucose values from the screen and uploads them to Nightscout.
