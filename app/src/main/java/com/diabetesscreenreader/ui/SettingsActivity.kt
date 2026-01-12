@@ -44,6 +44,7 @@ class SettingsActivity : ComponentActivity() {
                 SettingsScreen(
                     preferencesManager = app.preferencesManager,
                     nightscoutApi = app.nightscoutApi,
+                    repository = app.repository,
                     onBack = { finish() },
                     installedApps = getInstalledApps()
                 )
@@ -81,11 +82,14 @@ data class AppInfo(
 fun SettingsScreen(
     preferencesManager: com.diabetesscreenreader.data.PreferencesManager,
     nightscoutApi: com.diabetesscreenreader.network.NightscoutApi,
+    repository: com.diabetesscreenreader.data.GlucoseRepository,
     onBack: () -> Unit,
     installedApps: List<AppInfo>
 ) {
     val scope = rememberCoroutineScope()
     val context = LocalContext.current
+
+    var isClearingQueue by remember { mutableStateOf(false) }
 
     // Collect preferences
     val nightscoutUrl by preferencesManager.nightscoutUrl.collectAsStateWithLifecycle(initialValue = "")
@@ -97,6 +101,7 @@ fun SettingsScreen(
     val lowThreshold by preferencesManager.lowThreshold.collectAsStateWithLifecycle(initialValue = 70)
     val highThreshold by preferencesManager.highThreshold.collectAsStateWithLifecycle(initialValue = 180)
     val onlyReadWhenInactive by preferencesManager.onlyReadWhenAppInactive.collectAsStateWithLifecycle(initialValue = true)
+    val sageCheckInterval by preferencesManager.sageCheckIntervalMinutes.collectAsStateWithLifecycle(initialValue = 30)
 
     // Local state for editing
     var editUrl by remember(nightscoutUrl) { mutableStateOf(nightscoutUrl) }
@@ -219,6 +224,40 @@ fun SettingsScreen(
                             } else {
                                 Text("Testen")
                             }
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(8.dp))
+
+                    // Clear Upload Queue Button
+                    OutlinedButton(
+                        onClick = {
+                            scope.launch {
+                                isClearingQueue = true
+                                val result = repository.clearUploadQueue()
+                                isClearingQueue = false
+
+                                val message = if (result.isSuccess) {
+                                    val count = result.getOrNull() ?: 0
+                                    "Upload-Queue gelöscht: $count Einträge"
+                                } else {
+                                    "Fehler beim Löschen: ${result.exceptionOrNull()?.message}"
+                                }
+                                Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+                            }
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                        enabled = !isClearingQueue
+                    ) {
+                        if (isClearingQueue) {
+                            CircularProgressIndicator(
+                                modifier = Modifier.size(16.dp),
+                                strokeWidth = 2.dp
+                            )
+                            Spacer(modifier = Modifier.width(8.dp))
+                            Text("Wird gelöscht...")
+                        } else {
+                            Text("Upload-Queue löschen")
                         }
                     }
                 }
@@ -403,6 +442,53 @@ fun SettingsScreen(
                             keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
                             singleLine = true
                         )
+                    }
+                }
+            }
+
+            // SAGE/IAGE Settings
+            Text(
+                text = "Sensor & Insulin",
+                style = MaterialTheme.typography.titleLarge,
+                fontWeight = FontWeight.Bold
+            )
+
+            Card(modifier = Modifier.fillMaxWidth()) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    Text(
+                        text = "SAGE/IAGE Check-Intervall",
+                        style = MaterialTheme.typography.bodyMedium
+                    )
+                    Text(
+                        text = "Wie oft Sensor- und Insulin-Alter geprüft und zu Nightscout synchronisiert werden",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceEvenly
+                    ) {
+                        listOf(
+                            1 to "1min",
+                            15 to "15min",
+                            30 to "30min",
+                            60 to "1h",
+                            360 to "6h"
+                        ).forEach { (minutes, label) ->
+                            FilterChip(
+                                selected = sageCheckInterval == minutes,
+                                onClick = {
+                                    scope.launch {
+                                        preferencesManager.setSageCheckIntervalMinutes(minutes)
+                                    }
+                                },
+                                label = { Text(label) }
+                            )
+                        }
                     }
                 }
             }

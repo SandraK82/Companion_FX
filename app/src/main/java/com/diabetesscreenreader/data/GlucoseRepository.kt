@@ -1,5 +1,6 @@
 package com.diabetesscreenreader.data
 
+import android.util.Log
 import com.diabetesscreenreader.network.NightscoutApi
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.first
@@ -21,15 +22,32 @@ class GlucoseRepository(
     fun getReadingsSince(since: Long): Flow<List<GlucoseReading>> =
         glucoseDao.getReadingsSinceFlow(since)
 
+    fun getUnuploadedReadingsFlow(): Flow<List<GlucoseReading>> =
+        glucoseDao.getUnuploadedReadingsFlow()
+
+    fun getAllReadingsFlow(limit: Int): Flow<List<GlucoseReading>> =
+        glucoseDao.getAllReadingsFlow(limit)
+
     suspend fun insertReading(reading: GlucoseReading): Long {
         val id = glucoseDao.insert(reading)
+        Log.d(TAG, "Reading saved to database with id=$id")
 
         // Auto-upload to Nightscout if enabled
-        if (preferencesManager.nightscoutEnabled.first()) {
+        val nightscoutEnabled = preferencesManager.nightscoutEnabled.first()
+        Log.d(TAG, "Nightscout enabled: $nightscoutEnabled")
+
+        if (nightscoutEnabled) {
+            Log.d(TAG, "Starting Nightscout upload...")
             uploadToNightscout(reading.copy(id = id))
+        } else {
+            Log.d(TAG, "Nightscout upload skipped (not enabled)")
         }
 
         return id
+    }
+
+    companion object {
+        private const val TAG = "GlucoseRepository"
     }
 
     suspend fun insertReadingWithoutUpload(reading: GlucoseReading): Long {
@@ -37,10 +55,19 @@ class GlucoseRepository(
     }
 
     private suspend fun uploadToNightscout(reading: GlucoseReading) {
-        val result = nightscoutApi.uploadReading(reading)
-        if (result.isSuccess) {
-            glucoseDao.markAsUploaded(reading.id, result.getOrNull() ?: "")
-            preferencesManager.setLastSyncTime(System.currentTimeMillis())
+        Log.d(TAG, "Uploading reading ${reading.id} to Nightscout...")
+        try {
+            // Use extended upload with device status and event detection
+            val result = nightscoutApi.uploadReadingWithExtras(reading)
+            if (result.isSuccess) {
+                Log.d(TAG, "Nightscout upload successful for reading ${reading.id}")
+                glucoseDao.markAsUploaded(reading.id, "uploaded")
+                preferencesManager.setLastSyncTime(System.currentTimeMillis())
+            } else {
+                Log.e(TAG, "Nightscout upload failed: ${result.exceptionOrNull()?.message}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Nightscout upload exception", e)
         }
     }
 
@@ -117,6 +144,15 @@ class GlucoseRepository(
     suspend fun cleanupOldData(daysToKeep: Int = 90) {
         val threshold = System.currentTimeMillis() - (daysToKeep * 24 * 60 * 60 * 1000L)
         glucoseDao.deleteOldReadings(threshold)
+    }
+
+    suspend fun clearUploadQueue(): Result<Int> {
+        return try {
+            val count = glucoseDao.clearUploadQueue()
+            Result.success(count)
+        } catch (e: Exception) {
+            Result.failure(e)
+        }
     }
 }
 

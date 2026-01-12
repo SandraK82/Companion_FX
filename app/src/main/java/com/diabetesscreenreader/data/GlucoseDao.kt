@@ -39,8 +39,14 @@ interface GlucoseDao {
     @Query("SELECT * FROM glucose_readings WHERE timestamp >= :since ORDER BY timestamp ASC")
     suspend fun getReadingsSince(since: Long): List<GlucoseReading>
 
-    @Query("SELECT * FROM glucose_readings WHERE uploadedToNightscout = 0 ORDER BY timestamp ASC")
+    @Query("SELECT * FROM glucose_readings WHERE uploadedToNightscout = 0 ORDER BY timestamp DESC")
     suspend fun getUnuploadedReadings(): List<GlucoseReading>
+
+    @Query("SELECT * FROM glucose_readings WHERE uploadedToNightscout = 0 ORDER BY timestamp DESC")
+    fun getUnuploadedReadingsFlow(): Flow<List<GlucoseReading>>
+
+    @Query("SELECT * FROM glucose_readings ORDER BY timestamp DESC LIMIT :limit")
+    fun getAllReadingsFlow(limit: Int): Flow<List<GlucoseReading>>
 
     @Query("UPDATE glucose_readings SET uploadedToNightscout = 1, nightscoutId = :nightscoutId WHERE id = :id")
     suspend fun markAsUploaded(id: Long, nightscoutId: String)
@@ -56,4 +62,7 @@ interface GlucoseDao {
 
     @Query("SELECT * FROM glucose_readings WHERE timestamp >= :since ORDER BY timestamp DESC")
     fun getReadingsSinceFlow(since: Long): Flow<List<GlucoseReading>>
+
+    @Query("UPDATE glucose_readings SET uploadedToNightscout = 1, nightscoutId = 'cleared' WHERE uploadedToNightscout = 0")
+    suspend fun clearUploadQueue(): Int
 }

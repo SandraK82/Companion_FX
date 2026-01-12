@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import com.diabetesscreenreader.data.AppDatabase
+import com.diabetesscreenreader.data.GlucoseRepository
 import com.diabetesscreenreader.data.PreferencesManager
 import com.diabetesscreenreader.network.NightscoutApi
 import kotlinx.coroutines.CoroutineScope
@@ -25,6 +26,10 @@ class DiabetesScreenReaderApp : Application() {
 
     val nightscoutApi: NightscoutApi by lazy {
         NightscoutApi(preferencesManager)
+    }
+
+    val repository: GlucoseRepository by lazy {
+        GlucoseRepository(database.glucoseDao(), nightscoutApi, preferencesManager)
     }
 
     override fun onCreate() {
@@ -52,15 +57,30 @@ class DiabetesScreenReaderApp : Application() {
             enableVibration(true)
         }
 
+        val lockscreenChannel = NotificationChannel(
+            LOCKSCREEN_READING_CHANNEL_ID,
+            "Sperrbildschirm-Abfragen",
+            NotificationManager.IMPORTANCE_HIGH
+        ).apply {
+            description = "Ermöglicht Glukose-Abfragen über den Sperrbildschirm"
+            setSound(null, null)
+            enableVibration(false)
+            setShowBadge(false)
+            lockscreenVisibility = android.app.Notification.VISIBILITY_PUBLIC
+        }
+
         val notificationManager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
         notificationManager.createNotificationChannel(channel)
         notificationManager.createNotificationChannel(alertChannel)
+        notificationManager.createNotificationChannel(lockscreenChannel)
     }
 
     companion object {
         const val NOTIFICATION_CHANNEL_ID = "diabetes_monitoring"
         const val ALERT_CHANNEL_ID = "glucose_alerts"
+        const val LOCKSCREEN_READING_CHANNEL_ID = "lockscreen_reading"
         const val NOTIFICATION_ID = 1001
+        const val LOCKSCREEN_NOTIFICATION_ID = 1002
 
         @Volatile
         private var instance: DiabetesScreenReaderApp? = null

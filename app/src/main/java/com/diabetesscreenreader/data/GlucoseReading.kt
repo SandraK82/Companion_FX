@@ -14,7 +14,20 @@ data class GlucoseReading(
     val timestamp: Long = System.currentTimeMillis(),
     val source: String = "",
     val uploadedToNightscout: Boolean = false,
-    val nightscoutId: String? = null
+    val nightscoutId: String? = null,
+
+    // CamAPS FX specific data
+    val activeInsulin: Double? = null, // IOB in IE
+    val basalRate: Double? = null, // IE/h
+    val reservoir: Double? = null, // IE
+    val pumpBattery: Int? = null, // %
+    val bolusAmount: Double? = null, // IE
+    val bolusMinutesAgo: Int? = null,
+    val pumpConnectionMinutesAgo: Int? = null,
+    val sensorDataMinutesAgo: Int? = null,
+    val glucoseTarget: Double? = null, // mg/dL
+    val insulinToday: Double? = null, // IE
+    val insulinYesterday: Double? = null // IE
 ) {
     fun getValueInUnit(targetUnit: GlucoseUnit): Double {
         return when {
@@ -105,4 +118,103 @@ data class NightscoutEntry(
     val date: Long,
     val dateString: String,
     val device: String = "DiabetesScreenReader"
+)
+
+@Serializable
+data class NightscoutDeviceStatus(
+    val device: String = "loop://CamAPSFX-ScreenReader",
+    val created_at: String? = null,
+    val date: Long,
+    val uploaderBattery: Int? = null,
+    val isCharging: Boolean? = null,
+    val pump: PumpStatus? = null,
+    val openaps: OpenAPSStatus? = null,
+    val uploader: UploaderInfo? = null
+)
+
+@Serializable
+data class UploaderInfo(
+    val battery: Int?
+)
+
+@Serializable
+data class PumpStatus(
+    val clock: String,  // ISO timestamp
+    val battery: PumpBattery? = null,
+    val reservoir: Double? = null,
+    val status: PumpStatusInfo? = null
+)
+
+@Serializable
+data class PumpBattery(
+    val percent: Int?,
+    val voltage: Double? = null
+)
+
+@Serializable
+data class PumpStatusInfo(
+    val status: String = "normal",
+    val timestamp: String
+)
+
+@Serializable
+data class OpenAPSStatus(
+    val suggested: OpenAPSSuggested? = null,
+    val enacted: OpenAPSEnacted? = null,
+    val iob: OpenAPSIOB? = null
+)
+
+@Serializable
+data class OpenAPSSuggested(
+    val temp: String? = null,
+    val bg: Int? = null,
+    val tick: String? = null,
+    val eventualBG: Int? = null,
+    val insulinReq: Double? = null,
+    val rate: Double? = null,
+    val duration: Int? = null,
+    val timestamp: String,
+    val reason: String? = null
+)
+
+@Serializable
+data class OpenAPSEnacted(
+    val temp: String? = null,
+    val bg: Int? = null,
+    val tick: String? = null,
+    val rate: Double? = null,
+    val duration: Int? = null,
+    val timestamp: String,
+    val reason: String? = null
+)
+
+@Serializable
+data class OpenAPSIOB(
+    val iob: Double,
+    val basaliob: Double? = null,
+    val bolusiob: Double,
+    val timestamp: String
+)
+
+@Serializable
+data class NightscoutTreatment(
+    val eventType: String,
+    val created_at: String,
+    val date: Long? = null,
+    val device: String = "loop://CamAPSFX-ScreenReader",
+    val app: String = "AndroidAPS",
+    val isValid: Boolean = true,
+    val isReadOnly: Boolean = false,
+    val enteredBy: String = "CamAPSFX-ScreenReader",
+    val notes: String? = null,
+    val insulin: Double? = null,
+    val type: String? = null, // For bolus: "NORMAL", "SMB", "PRIMING"
+    val isBasalInsulin: Boolean? = null,
+    val carbs: Double? = null,
+    val glucose: Double? = null,
+    val glucoseType: String? = null,
+    val units: String? = null,
+    val pumpId: Long? = null,
+    val pumpType: String? = null,
+    val pumpSerial: String? = null
 )

@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
-    <string name="app_name">Diabetes Screen Reader</string>
+    <string name="app_name">Companion FX</string>
     <string name="accessibility_service_description">Dieser Dienst liest Diabetes-Daten von anderen Apps ab, um sie anzuzeigen und an Nightscout zu übertragen.</string>
 
     <!-- Main Screen -->
@@ -37,7 +37,7 @@
     <string name="high_threshold">Oberer Grenzwert</string>
 
     <!-- Widget -->
-    <string name="widget_name">Diabetes Widget</string>
+    <string name="widget_name">Companion FX Widget</string>
     <string name="widget_description">Zeigt aktuelle Glukosewerte und Verlaufsgraph</string>
     <string name="no_data">Keine Daten</string>
     <string name="ago">vor</string>
@@ -52,13 +52,19 @@
     <string name="trend_forty_five_down">↘ Leicht fallend</string>
     <string name="trend_single_down">↓ Fallend</string>
     <string name="trend_double_down">↓↓ Stark fallend</string>
-    <string name="trend_unknown">? Unbekannt</string>
+    <string name="trend_unknown">\? Unbekannt</string>
 
     <!-- Notifications -->
     <string name="notification_channel_name">Diabetes Monitoring</string>
     <string name="notification_channel_description">Benachrichtigungen über Glukosewerte</string>
-    <string name="notification_title">Diabetes Screen Reader aktiv</string>
+    <string name="notification_title">Companion FX aktiv</string>
     <string name="notification_text">Überwacht Glukosewerte</string>
+
+    <!-- Lockscreen Reading -->
+    <string name="lockscreen_notification_title">Glukose-Abfrage läuft</string>
+    <string name="lockscreen_notification_text">Liest Daten von CamAPS FX...</string>
+    <string name="lockscreen_channel_name">Sperrbildschirm-Abfragen</string>
+    <string name="lockscreen_channel_description">Ermöglicht Glukose-Abfragen über den Sperrbildschirm</string>
 
     <!-- Errors -->
     <string name="error_no_accessibility_permission">Bitte aktiviere den Accessibility Service in den Einstellungen</string>

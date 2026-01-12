@@ -24,6 +24,11 @@ class PreferencesManager(private val context: Context) {
         val SERVICE_ENABLED = booleanPreferencesKey("service_enabled")
         val ONLY_READ_WHEN_APP_INACTIVE = booleanPreferencesKey("only_read_when_app_inactive")
         val LAST_SYNC_TIME = longPreferencesKey("last_sync_time")
+        // SAGE and IAGE tracking
+        val SENSOR_START_TIME = longPreferencesKey("sensor_start_time")
+        val SENSOR_NAME = stringPreferencesKey("sensor_name")
+        val INSULIN_FILL_TIME = longPreferencesKey("insulin_fill_time")
+        val SAGE_CHECK_INTERVAL_MINUTES = intPreferencesKey("sage_check_interval_minutes")
     }
 
     // Nightscout Settings
@@ -54,7 +59,7 @@ class PreferencesManager(private val context: Context) {
 
     // Reading Interval
     val readingIntervalMinutes: Flow<Int> = context.dataStore.data.map {
-        it[Keys.READING_INTERVAL_MINUTES] ?: 5
+        it[Keys.READING_INTERVAL_MINUTES] ?: 1
     }
 
     suspend fun setReadingIntervalMinutes(minutes: Int) {
@@ -91,7 +96,7 @@ class PreferencesManager(private val context: Context) {
     }
 
     val onlyReadWhenAppInactive: Flow<Boolean> = context.dataStore.data.map {
-        it[Keys.ONLY_READ_WHEN_APP_INACTIVE] ?: true
+        it[Keys.ONLY_READ_WHEN_APP_INACTIVE] ?: false
     }
 
     suspend fun setOnlyReadWhenAppInactive(enabled: Boolean) {
@@ -103,6 +108,31 @@ class PreferencesManager(private val context: Context) {
 
     suspend fun setLastSyncTime(time: Long) {
         context.dataStore.edit { it[Keys.LAST_SYNC_TIME] = time }
+    }
+
+    // SAGE (Sensor Age) and IAGE (Insulin Age)
+    val sensorStartTime: Flow<Long> = context.dataStore.data.map { it[Keys.SENSOR_START_TIME] ?: 0L }
+    val sensorName: Flow<String> = context.dataStore.data.map { it[Keys.SENSOR_NAME] ?: "" }
+    val insulinFillTime: Flow<Long> = context.dataStore.data.map { it[Keys.INSULIN_FILL_TIME] ?: 0L }
+
+    suspend fun setSensorInfo(startTime: Long, name: String?) {
+        context.dataStore.edit {
+            it[Keys.SENSOR_START_TIME] = startTime
+            it[Keys.SENSOR_NAME] = name ?: ""
+        }
+    }
+
+    suspend fun setInsulinFillTime(fillTime: Long) {
+        context.dataStore.edit { it[Keys.INSULIN_FILL_TIME] = fillTime }
+    }
+
+    // SAGE/IAGE check interval (in minutes)
+    val sageCheckIntervalMinutes: Flow<Int> = context.dataStore.data.map {
+        it[Keys.SAGE_CHECK_INTERVAL_MINUTES] ?: 30  // Default 30 minutes
+    }
+
+    suspend fun setSageCheckIntervalMinutes(minutes: Int) {
+        context.dataStore.edit { it[Keys.SAGE_CHECK_INTERVAL_MINUTES] = minutes }
     }
 
     // Convenience methods for synchronous access

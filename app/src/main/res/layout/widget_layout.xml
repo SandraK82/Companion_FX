@@ -41,7 +41,7 @@
             android:textColor="@color/widget_text"
             tools:text="→" />
 
-        <View
+        <TextView
             android:layout_width="0dp"
             android:layout_height="0dp"
             android:layout_weight="1" />
@@ -71,7 +71,111 @@
             android:contentDescription="@string/history" />
     </FrameLayout>
 
-    <!-- Footer with range info -->
+    <!-- Status info grid -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="horizontal"
+        android:layout_marginTop="4dp">
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/basal_rate_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="@color/widget_text_secondary"
+                android:text="Basalrate" />
+
+            <TextView
+                android:id="@+id/basal_rate"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:textColor="@color/widget_text"
+                tools:text="0,50 IE/h" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/active_insulin_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="@color/widget_text_secondary"
+                android:text="Aktiv" />
+
+            <TextView
+                android:id="@+id/active_insulin"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:textColor="@color/widget_text"
+                tools:text="1,65 IE" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/reservoir_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="@color/widget_text_secondary"
+                android:text="Reservoir" />
+
+            <TextView
+                android:id="@+id/reservoir"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:textColor="@color/widget_text"
+                tools:text="150 IE" />
+        </LinearLayout>
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:orientation="vertical">
+
+            <TextView
+                android:id="@+id/battery_label"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="10sp"
+                android:textColor="@color/widget_text_secondary"
+                android:text="Batterie" />
+
+            <TextView
+                android:id="@+id/battery"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:textSize="12sp"
+                android:textStyle="bold"
+                android:textColor="@color/widget_text"
+                tools:text="60%" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- Footer with range info and sync status -->
     <LinearLayout
         android:layout_width="match_parent"
         android:layout_height="wrap_content"
@@ -86,7 +190,7 @@
             android:textColor="@color/widget_text_secondary"
             tools:text="70-180 mg/dL" />
 
-        <View
+        <TextView
             android:layout_width="0dp"
             android:layout_height="0dp"
             android:layout_weight="1" />
