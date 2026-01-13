@@ -112,6 +112,9 @@ class DiabetesAccessibilityService : AccessibilityService() {
     // Track when we last checked SAGE (Sensor Age)
     private var lastSageCheckTime = 0L
 
+    // Flag to enable/disable landscape view exploration for OCR
+    private val EXPLORE_LANDSCAPE_VIEW = true  // Set to false to disable
+
     private val app: DiabetesScreenReaderApp
         get() = application as DiabetesScreenReaderApp
 
@@ -133,12 +136,49 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
         instance = this
 
+        // Set up OCR treatment callback to upload carbs to Nightscout
+        setupOCRTreatmentCallback()
+
         // Initialize AlarmManager for periodic reading
         setupAlarmManager()
         scheduleNextReading(5000L) // First reading after 5 seconds
 
         // Start health check watchdog
         startHealthCheckWatchdog()
+    }
+
+    /**
+     * Sets up the callback for when OCR detects carbs in the landscape graph.
+     * When carbs are found, they are uploaded to Nightscout as a meal treatment.
+     */
+    private fun setupOCRTreatmentCallback() {
+        camapsFXReader.onTreatmentFound = { treatment ->
+            val carbs = treatment.carbsGrams
+            if (carbs != null && carbs > 0) {
+                Log.d(TAG, "OCR detected carbs: $carbs g - uploading to Nightscout")
+                serviceScope.launch {
+                    try {
+                        // Check if Nightscout is enabled
+                        val nightscoutEnabled = app.preferencesManager.nightscoutEnabled.first()
+                        if (!nightscoutEnabled) {
+                            Log.d(TAG, "Nightscout disabled, skipping meal upload")
+                            return@launch
+                        }
+
+                        // Upload meal treatment
+                        val result = app.nightscoutApi.uploadMealTreatment(carbs, treatment.timestamp)
+                        result.onSuccess {
+                            Log.d(TAG, "✓ Meal uploaded to Nightscout: $carbs g")
+                        }.onFailure { e ->
+                            Log.e(TAG, "Failed to upload meal to Nightscout: ${e.message}")
+                        }
+                    } catch (e: Exception) {
+                        Log.e(TAG, "Error uploading meal to Nightscout", e)
+                    }
+                }
+            }
+        }
+        Log.d(TAG, "OCR treatment callback configured")
     }
 
     /**
@@ -565,10 +605,7 @@ class DiabetesAccessibilityService : AccessibilityService() {
                         button.performAction(AccessibilityNodeInfo.ACTION_CLICK)
                         foundButton = true
                     }
-                    button.recycle()
                 }
-
-                rootNode.recycle()
 
                 if (foundButton) {
                     return
@@ -590,10 +627,6 @@ class DiabetesAccessibilityService : AccessibilityService() {
             val child = node.getChild(i)
             if (child != null) {
                 findCloseButtons(child, result)
-                // Only recycle if child was NOT added to result list
-                if (!result.contains(child)) {
-                    child.recycle()
-                }
             }
         }
     }
@@ -621,9 +654,6 @@ class DiabetesAccessibilityService : AccessibilityService() {
                         camapsFXWindow = rootNode
                         Log.d(TAG, "Found CamAPS FX window: $packageName")
                         break
-                    } else {
-                        // Recycle nodes we don't need
-                        rootNode.recycle()
                     }
                 }
             }
@@ -664,8 +694,6 @@ class DiabetesAccessibilityService : AccessibilityService() {
                                 readDataAndNavigateBack(activeRoot)
                                 foundCamAPS = true
                                 break
-                            } else {
-                                activeRoot.recycle()
                             }
                         }
 
@@ -688,48 +716,55 @@ class DiabetesAccessibilityService : AccessibilityService() {
     }
     
     private suspend fun readDataAndNavigateBack(rootNode: AccessibilityNodeInfo) {
-        try {
-            // Extract data
-            val glucoseData = camapsFXReader.extractData(rootNode, this)
+        // Extract data
+        val glucoseData = camapsFXReader.extractData(rootNode, this)
 
-            if (glucoseData != null) {
-                // Validate data
-                if (glucoseData.value <= 0) {
-                    Log.e(TAG, "CRITICAL: Rejecting invalid value: ${glucoseData.value}")
-                } else if (glucoseData.value < 40 || glucoseData.value > 400) {
-                    Log.e(TAG, "CRITICAL: Rejecting out-of-range value: ${glucoseData.value}")
-                } else {
-                    // Save data
-                    lastReadingTime = System.currentTimeMillis()
-                    lastReadingValue = glucoseData.value
-
-                    // Check if bolus is a duplicate and remove it if necessary
-                    val finalData = deduplicateBolus(glucoseData)
-
-                    Log.d(TAG, "Saving glucose reading: ${finalData.value} ${finalData.unit.getDisplayString()}")
-                    repository.insertReading(finalData)
-
-                    // Notify widget
-                    sendBroadcast(Intent(ACTION_GLUCOSE_UPDATE))
-
-                    // Check SAGE/IAGE periodically (interval from preferences)
-                    val sageIntervalMinutes = app.preferencesManager.sageCheckIntervalMinutes.first()
-                    val sageIntervalMs = sageIntervalMinutes * 60 * 1000L
-                    val timeSinceLastSageCheck = System.currentTimeMillis() - lastSageCheckTime
-                    if (timeSinceLastSageCheck >= sageIntervalMs) {
-                        Log.d(TAG, "SAGE check due (${timeSinceLastSageCheck / 60000}min since last check, interval=${sageIntervalMinutes}min)")
-                        performSAGECheck(rootNode)
-                    }
-                }
+        if (glucoseData != null) {
+            // Validate data
+            if (glucoseData.value <= 0) {
+                Log.e(TAG, "CRITICAL: Rejecting invalid value: ${glucoseData.value}")
+            } else if (glucoseData.value < 40 || glucoseData.value > 400) {
+                Log.e(TAG, "CRITICAL: Rejecting out-of-range value: ${glucoseData.value}")
             } else {
-                Log.w(TAG, "Failed to extract glucose data")
+                // Save data
+                lastReadingTime = System.currentTimeMillis()
+                lastReadingValue = glucoseData.value
+
+                // Check if bolus is a duplicate and remove it if necessary
+                val finalData = deduplicateBolus(glucoseData)
+
+                Log.d(TAG, "Saving glucose reading: ${finalData.value} ${finalData.unit.getDisplayString()}")
+                repository.insertReading(finalData)
+
+                // Notify widget
+                sendBroadcast(Intent(ACTION_GLUCOSE_UPDATE))
+
+                // Check SAGE/IAGE periodically (interval from preferences)
+                val sageIntervalMinutes = app.preferencesManager.sageCheckIntervalMinutes.first()
+                val sageIntervalMs = sageIntervalMinutes * 60 * 1000L
+                val timeSinceLastSageCheck = System.currentTimeMillis() - lastSageCheckTime
+                if (timeSinceLastSageCheck >= sageIntervalMs) {
+                    Log.d(TAG, "SAGE check due (${timeSinceLastSageCheck / 60000}min since last check, interval=${sageIntervalMinutes}min)")
+                    performSAGECheck()
+                }
             }
+        } else {
+            Log.w(TAG, "Failed to extract glucose data")
+        }
 
-            // No navigation back - leave CamAPS FX open (follower phone)
-            Log.d(TAG, "Reading complete - leaving CamAPS FX open")
+        // No navigation back - leave CamAPS FX open (follower phone)
+        Log.d(TAG, "Reading complete - leaving CamAPS FX open")
 
-        } finally {
-            rootNode.recycle()
+        // OCR: Explore landscape view to find carbs treatments in the graph
+        if (EXPLORE_LANDSCAPE_VIEW) {
+            Log.d(TAG, "=== Exploring landscape view for OCR ===")
+            val freshRootNode = rootInActiveWindow
+            if (freshRootNode != null) {
+                val success = camapsFXReader.exploreLandscapeView(freshRootNode, this)
+                if (success) {
+                    Log.d(TAG, "Landscape view exploration completed successfully")
+                }
+            }
         }
     }
 
@@ -737,7 +772,7 @@ class DiabetesAccessibilityService : AccessibilityService() {
      * Checks sensor age (SAGE) and insulin age (IAGE) by reading from CamAPS FX burger menu
      * and comparing/updating Nightscout if needed.
      */
-    private suspend fun performAgeCheck(rootNode: AccessibilityNodeInfo) {
+    private suspend fun performAgeCheck() {
         try {
             // Check if Nightscout is enabled
             val nightscoutEnabled = app.preferencesManager.nightscoutEnabled.first()
@@ -760,7 +795,6 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
             if (ageInfo == null) {
                 Log.w(TAG, "Could not extract age info from CamAPS FX menu")
-                freshRootNode.recycle()
                 return
             }
 
@@ -807,7 +841,6 @@ class DiabetesAccessibilityService : AccessibilityService() {
             }
 
             lastSageCheckTime = System.currentTimeMillis()
-            freshRootNode.recycle()
 
         } catch (e: Exception) {
             Log.e(TAG, "Error during age check", e)
@@ -815,7 +848,7 @@ class DiabetesAccessibilityService : AccessibilityService() {
     }
 
     // Legacy alias for backwards compatibility
-    private suspend fun performSAGECheck(rootNode: AccessibilityNodeInfo) = performAgeCheck(rootNode)
+    private suspend fun performSAGECheck() = performAgeCheck()
 
     private fun bringCamAPSFXToForeground(packageName: String): Boolean {
         return try {

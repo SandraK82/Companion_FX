@@ -5,7 +5,12 @@ import android.view.accessibility.AccessibilityNodeInfo
 import com.diabetesscreenreader.data.GlucoseReading
 import com.diabetesscreenreader.data.GlucoseTrend
 import com.diabetesscreenreader.data.GlucoseUnit
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.text.TextRecognition
+import com.google.mlkit.vision.text.latin.TextRecognizerOptions
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.suspendCancellableCoroutine
+import kotlin.coroutines.resume
 
 /**
  * Specialized reader for mylife CamAPS FX app
@@ -13,9 +18,75 @@ import kotlinx.coroutines.delay
  */
 class CamAPSFXReader {
 
+    /**
+     * Data class for treatment entries found via OCR in the graph
+     */
+    data class GraphTreatment(
+        val insulinUnits: Double? = null,  // IE value (e.g., 7.5)
+        val carbsGrams: Int? = null,       // g value (e.g., 30)
+        val timestamp: Long = System.currentTimeMillis()
+    ) {
+        val hasInsulin: Boolean get() = insulinUnits != null && insulinUnits > 0
+        val hasCarbs: Boolean get() = carbsGrams != null && carbsGrams > 0
+        val hasBoth: Boolean get() = hasInsulin && hasCarbs
+    }
+
     companion object {
         private const val TAG = "CamAPSFXReader"
         private const val PACKAGE_NAME = "com.camdiab.fx.camaps"
+        private const val PACKAGE_NAME_MGDL = "com.camdiab.fx_alert.mgdl"
+        private const val PACKAGE_NAME_MMOL = "com.camdiab.fx_alert.mmol"
+        private const val MAX_DEPTH = 20
+
+        // Regex patterns for OCR treatment markers
+        // Carbs pattern: matches "30 g" or "30g" but NOT "mg" or part of "Glukose"
+        // Uses negative lookbehind for 'm' to avoid matching "mg"
+        // Requires word boundary after 'g' to avoid matching "Glukose"
+        private val CARBS_PATTERN = Regex("""(?<!m)(\d{1,3})\s*g\b""", RegexOption.IGNORE_CASE)
+        // Time label pattern: matches "21:00", "23:00", "00:00"
+        private val TIME_PATTERN = Regex("""(\d{2}):(\d{2})""")
+
+        // Duplicate detection window: ±30 minutes
+        private const val DUPLICATE_WINDOW_MS = 30 * 60 * 1000L  // 30 minutes
+
+        // Check if package belongs to CamAPS FX (any variant)
+        fun isCamAPSFXPackage(packageName: String?): Boolean {
+            return packageName?.startsWith("com.camdiab.fx") == true
+        }
+    }
+
+    // Track last sent meal for duplicate detection
+    private var lastSentMealCarbs: Int? = null
+    private var lastSentMealTime: Long = 0L
+
+    // Callback for when OCR finds NEW treatments (after duplicate check)
+    var onTreatmentFound: ((GraphTreatment) -> Unit)? = null
+
+    /**
+     * Check if a carbs value is a duplicate of the last sent meal
+     * Returns true if this appears to be a duplicate (same carbs within ±30 min)
+     */
+    private fun isDuplicateMeal(carbsGrams: Int): Boolean {
+        val lastCarbs = lastSentMealCarbs ?: return false
+        val timeDiff = kotlin.math.abs(System.currentTimeMillis() - lastSentMealTime)
+
+        // Consider it a duplicate if same carbs amount within the time window
+        val isDuplicate = (carbsGrams == lastCarbs) && (timeDiff < DUPLICATE_WINDOW_MS)
+
+        if (isDuplicate) {
+            Log.d(TAG, "Duplicate meal detected: $carbsGrams g (last: $lastCarbs g, ${timeDiff / 60000}min ago)")
+        }
+
+        return isDuplicate
+    }
+
+    /**
+     * Mark a meal as sent (for duplicate tracking)
+     */
+    private fun markMealAsSent(carbsGrams: Int) {
+        lastSentMealCarbs = carbsGrams
+        lastSentMealTime = System.currentTimeMillis()
+        Log.d(TAG, "Marked meal as sent: $carbsGrams g at ${lastSentMealTime}")
     }
 
     /**
@@ -50,19 +121,15 @@ class CamAPSFXReader {
                     Log.d(TAG, "Got dialog window node, extracting data...")
                     // Extract data from information dialog
                     val detailedData = extractInformationDialogData(dialogNode)
-                    infoButton.recycle()
 
                     // Close dialog by clicking X button
                     val closeButton = findCloseButton(dialogNode)
                     if (closeButton != null) {
                         Log.d(TAG, "Closing info dialog...")
                         closeButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                        closeButton.recycle()
                     } else {
                         Log.w(TAG, "Could not find close button")
                     }
-
-                    dialogNode.recycle()
 
                     // Combine data (deduplication happens in DiabetesAccessibilityService)
                     Log.d(TAG, "Combining main screen data with detailed data: ${detailedData.keys}")
@@ -82,14 +149,12 @@ class CamAPSFXReader {
                     )
                 } else {
                     Log.w(TAG, "Could not get dialog window node")
-                    infoButton.recycle()
                 }
             } else {
                 if (infoButton == null) {
                     Log.w(TAG, "Could not find info button, returning main screen data only")
                 } else {
                     Log.w(TAG, "Service not provided, cannot read dialog")
-                    infoButton.recycle()
                 }
             }
 
@@ -417,10 +482,8 @@ class CamAPSFXReader {
             val child = node.getChild(i) ?: continue
             val found = findInfoButton(child, depth + 1)
             if (found != null) {
-                child.recycle()
                 return found
             }
-            child.recycle()
         }
 
         return null
@@ -462,6 +525,9 @@ class CamAPSFXReader {
                     contentDesc.contains("ablehnen") ||    // DE: dismiss
                     contentDesc.contains("dismiss") ||     // EN: dismiss
                     contentDesc.contains("rejeter") ||     // FR: dismiss
+                    contentDesc.contains("geschlossene optionen") ||  // DE: CamAPS FX drawer toggle (when open)
+                    contentDesc.contains("closed options") ||         // EN: drawer toggle
+                    contentDesc.contains("options fermées") ||        // FR: drawer toggle
                     text == "x" ||
                     text == "×" ||
                     text.contains("schließen") ||
@@ -482,10 +548,8 @@ class CamAPSFXReader {
             val child = node.getChild(i) ?: continue
             val found = findCloseButton(child)
             if (found != null) {
-                child.recycle()
                 return found
             }
-            child.recycle()
         }
 
         return null
@@ -513,7 +577,6 @@ class CamAPSFXReader {
         for (i in 0 until node.childCount) {
             val child = node.getChild(i) ?: continue
             collectAllText(child, result, depth + 1)
-            child.recycle()
         }
     }
 
@@ -637,6 +700,592 @@ class CamAPSFXReader {
     )
 
     /**
+     * EXPLORATORY: Opens the landscape/graph view and logs all content.
+     * This is used to understand what data is available on the landscape screen.
+     *
+     * The button is identified by:
+     * - DE: "Bildschirm drehen"
+     * - EN: "Rotate screen"
+     * - FR: "Rotation écran"
+     */
+    suspend fun exploreLandscapeView(
+        rootNode: AccessibilityNodeInfo,
+        service: android.accessibilityservice.AccessibilityService
+    ): Boolean {
+        try {
+            Log.d(TAG, "")
+            Log.d(TAG, "╔════════════════════════════════════════════════════════════╗")
+            Log.d(TAG, "║     DEBUG: LANDSCAPE VIEW EXPLORATION                      ║")
+            Log.d(TAG, "╚════════════════════════════════════════════════════════════╝")
+
+            // Step 1: Find the rotate/landscape button
+            val rotateButton = findRotateScreenButton(rootNode)
+            if (rotateButton == null) {
+                Log.w(TAG, "Could not find rotate screen button")
+                return false
+            }
+
+            val buttonId = rotateButton.viewIdResourceName ?: "unknown"
+            Log.d(TAG, "✓ Found rotate screen button (id=$buttonId), clicking NOW...")
+            val clickResult = rotateButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+            Log.d(TAG, "Click result: $clickResult")
+
+            // Step 2: Wait for view to load, then dump EVERYTHING
+            Log.d(TAG, "Waiting 3 seconds for landscape view to fully load...")
+            delay(3000)
+
+            Log.d(TAG, "")
+            Log.d(TAG, "╔════════════════════════════════════════════════════════════╗")
+            Log.d(TAG, "║     FULL SCREEN DUMP - ALL ACCESSIBLE ELEMENTS             ║")
+            Log.d(TAG, "╚════════════════════════════════════════════════════════════╝")
+
+            val currentNode = service.rootInActiveWindow
+            if (currentNode == null) {
+                Log.w(TAG, "No window available!")
+                return false
+            }
+
+            val packageName = currentNode.packageName?.toString() ?: "unknown"
+            Log.d(TAG, "")
+            Log.d(TAG, "=== WINDOW INFO ===")
+            Log.d(TAG, "Package: $packageName")
+            Log.d(TAG, "Class: ${currentNode.className}")
+            Log.d(TAG, "ChildCount: ${currentNode.childCount}")
+
+            // Dump ALL nodes with full details
+            Log.d(TAG, "")
+            Log.d(TAG, "=== ALL NODES (FULL TREE) ===")
+            dumpFullNodeTree(currentNode, 0)
+
+            // Collect and log all text
+            Log.d(TAG, "")
+            Log.d(TAG, "=== ALL TEXT ON SCREEN ===")
+            val allText = mutableListOf<String>()
+            collectAllText(currentNode, allText)
+            allText.forEachIndexed { index, text ->
+                Log.d(TAG, "  Text[$index]: '$text'")
+            }
+
+            // Log all clickable elements
+            Log.d(TAG, "")
+            Log.d(TAG, "=== ALL CLICKABLE ELEMENTS ===")
+            logAllClickableElements(currentNode)
+
+            // Step 3: Take a screenshot of the landscape view for OCR analysis
+            // Wait a bit more to ensure the landscape view is fully rendered
+            Log.d(TAG, "Waiting 1 second for landscape view to stabilize...")
+            delay(1000)
+
+            Log.d(TAG, "")
+            Log.d(TAG, "=== TAKING SCREENSHOT FOR OCR ===")
+            takeScreenshotForOCR(service)
+
+            Log.d(TAG, "")
+            Log.d(TAG, "╔════════════════════════════════════════════════════════════╗")
+            Log.d(TAG, "║     DEBUG COMPLETE - Landscape will close after OCR        ║")
+            Log.d(TAG, "╚════════════════════════════════════════════════════════════╝")
+            Log.d(TAG, "")
+
+            // Landscape view will be closed automatically after OCR completes
+            return true
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error exploring landscape view", e)
+            return false
+        }
+    }
+
+    /**
+     * Dumps the full node tree with all details for debugging
+     */
+    private fun dumpFullNodeTree(node: AccessibilityNodeInfo, depth: Int) {
+        if (depth > 15) return // Limit depth to avoid too much output
+
+        val indent = "  ".repeat(depth)
+        val className = node.className?.toString()?.substringAfterLast('.') ?: "?"
+        val text = node.text?.toString() ?: ""
+        val desc = node.contentDescription?.toString() ?: ""
+        val viewId = node.viewIdResourceName?.substringAfterLast('/') ?: ""
+        val bounds = android.graphics.Rect()
+        node.getBoundsInScreen(bounds)
+
+        val info = buildString {
+            append("$indent[$depth] $className")
+            if (viewId.isNotEmpty()) append(" id=$viewId")
+            if (text.isNotEmpty()) append(" text='${text.take(50)}'")
+            if (desc.isNotEmpty()) append(" desc='${desc.take(50)}'")
+            if (node.isClickable) append(" [CLICKABLE]")
+            if (node.isScrollable) append(" [SCROLLABLE]")
+            append(" bounds=${bounds.width()}x${bounds.height()}")
+        }
+        Log.d(TAG, info)
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            dumpFullNodeTree(child, depth + 1)
+        }
+    }
+
+    /**
+     * Takes a screenshot of the current screen and runs OCR to find treatments
+     */
+    private fun takeScreenshotForOCR(service: android.accessibilityservice.AccessibilityService) {
+        try {
+            if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.R) {
+                Log.d(TAG, "Taking screenshot for OCR (API 30+)...")
+
+                service.takeScreenshot(
+                    android.view.Display.DEFAULT_DISPLAY,
+                    service.mainExecutor,
+                    object : android.accessibilityservice.AccessibilityService.TakeScreenshotCallback {
+                        override fun onSuccess(screenshot: android.accessibilityservice.AccessibilityService.ScreenshotResult) {
+                            Log.d(TAG, "Screenshot successful!")
+                            val hardwareBitmap = android.graphics.Bitmap.wrapHardwareBuffer(
+                                screenshot.hardwareBuffer,
+                                screenshot.colorSpace
+                            )
+                            if (hardwareBitmap != null) {
+                                // Convert hardware bitmap to software bitmap for ML Kit
+                                val bitmap = hardwareBitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, false)
+                                hardwareBitmap.recycle()
+                                screenshot.hardwareBuffer.close()
+
+                                // Run OCR on the bitmap
+                                runOCR(bitmap, service)
+                            } else {
+                                Log.e(TAG, "Failed to create bitmap from screenshot")
+                            }
+                        }
+
+                        override fun onFailure(errorCode: Int) {
+                            Log.e(TAG, "Screenshot failed with error code: $errorCode")
+                        }
+                    }
+                )
+            } else {
+                Log.w(TAG, "Screenshot requires API 30+, current: ${android.os.Build.VERSION.SDK_INT}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error taking screenshot", e)
+        }
+    }
+
+    /**
+     * Runs ML Kit OCR on the bitmap and parses results for treatments
+     */
+    private fun runOCR(bitmap: android.graphics.Bitmap, service: android.accessibilityservice.AccessibilityService) {
+        try {
+            Log.d(TAG, "=== RUNNING ML KIT OCR ===")
+            Log.d(TAG, "Bitmap size: ${bitmap.width}x${bitmap.height}")
+
+            val image = InputImage.fromBitmap(bitmap, 0)
+            val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+
+            recognizer.process(image)
+                .addOnSuccessListener { visionText ->
+                    Log.d(TAG, "OCR completed successfully!")
+
+                    // Log each text block with bounding box
+                    Log.d(TAG, "=== TEXT BLOCKS WITH BOUNDING BOXES ===")
+                    visionText.textBlocks.forEachIndexed { blockIndex, block ->
+                        val box = block.boundingBox
+                        val boxStr = if (box != null) "[${box.left},${box.top} - ${box.right},${box.bottom}]" else "[no box]"
+                        Log.d(TAG, "Block[$blockIndex] $boxStr: '${block.text.replace("\n", "\\n")}'")
+
+                        // Also log individual lines within each block
+                        block.lines.forEachIndexed { lineIndex, line ->
+                            val lineBox = line.boundingBox
+                            val lineBoxStr = if (lineBox != null) "[${lineBox.left},${lineBox.top} - ${lineBox.right},${lineBox.bottom}]" else "[no box]"
+                            Log.d(TAG, "  Line[$lineIndex] $lineBoxStr: '${line.text}'")
+                        }
+                    }
+                    Log.d(TAG, "=== END TEXT BLOCKS ===")
+
+                    Log.d(TAG, "Full text found:\n${visionText.text}")
+
+                    // Parse the recognized text for treatments with time interpolation
+                    val treatments = parseOCRResultsWithTimestamps(visionText)
+
+                    Log.d(TAG, "")
+                    Log.d(TAG, "=== OCR RESULTS ===")
+                    Log.d(TAG, "Found ${treatments.size} treatment(s):")
+                    treatments.forEachIndexed { index, treatment ->
+                        Log.d(TAG, "  Treatment[$index]: insulin=${treatment.insulinUnits} IE, carbs=${treatment.carbsGrams} g")
+                        Log.d(TAG, "    hasInsulin=${treatment.hasInsulin}, hasCarbs=${treatment.hasCarbs}, hasBoth=${treatment.hasBoth}")
+                    }
+
+                    // Process carbs treatments (we only care about carbs for meal entries)
+                    // Take the LAST carbs value found (most recent visible on graph)
+                    val lastCarbsTreatment = treatments.lastOrNull { it.hasCarbs }
+
+                    if (lastCarbsTreatment != null && lastCarbsTreatment.carbsGrams != null) {
+                        val carbsGrams = lastCarbsTreatment.carbsGrams
+                        if (!isDuplicateMeal(carbsGrams)) {
+                            Log.d(TAG, "  → NEW meal found: $carbsGrams g - notifying callback")
+                            markMealAsSent(carbsGrams)
+                            onTreatmentFound?.invoke(lastCarbsTreatment)
+                        } else {
+                            Log.d(TAG, "  → Skipping duplicate meal: $carbsGrams g")
+                        }
+                    } else {
+                        Log.d(TAG, "  → No carbs treatments to process")
+                    }
+
+                    // Also save screenshot for debugging
+                    saveScreenshotForDebug(bitmap, service, treatments)
+                    bitmap.recycle()
+
+                    // Close landscape view after OCR
+                    closeLandscapeView(service)
+                }
+                .addOnFailureListener { e ->
+                    Log.e(TAG, "OCR failed", e)
+                    bitmap.recycle()
+
+                    // Still close landscape view even on failure
+                    closeLandscapeView(service)
+                }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error running OCR", e)
+            bitmap.recycle()
+        }
+    }
+
+    /**
+     * Closes the landscape view by clicking the "Bildschirm drehen" button again
+     * or by performing a back action
+     */
+    private fun closeLandscapeView(service: android.accessibilityservice.AccessibilityService) {
+        try {
+            Log.d(TAG, "Closing landscape view...")
+
+            // Small delay to ensure OCR result logging is visible
+            android.os.Handler(android.os.Looper.getMainLooper()).postDelayed({
+                // Try to find and click the rotate button to close landscape
+                val windows = service.windows
+                for (window in windows) {
+                    val rootNode = window.root ?: continue
+                    val packageName = rootNode.packageName?.toString() ?: ""
+
+                    if (isCamAPSFXPackage(packageName)) {
+                        // Look for the rotate button in landscape view
+                        val rotateButton = findRotateScreenButton(rootNode)
+                        if (rotateButton != null) {
+                            Log.d(TAG, "Found rotate button in landscape, clicking to close...")
+                            rotateButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                            Log.d(TAG, "Landscape view closed successfully")
+                            return@postDelayed
+                        }
+                    }
+                }
+
+                // Fallback: perform BACK action
+                Log.d(TAG, "Rotate button not found, performing BACK action")
+                service.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+
+            }, 500) // 500ms delay before closing
+
+        } catch (e: Exception) {
+            Log.e(TAG, "Error closing landscape view", e)
+        }
+    }
+
+    /**
+     * Data class for time label with X position
+     */
+    private data class TimeLabel(
+        val hour: Int,
+        val minute: Int,
+        val xCenter: Int
+    )
+
+    /**
+     * Parses OCR text blocks to find carbs (g) values with their estimated timestamps
+     * Uses the X position of time labels to interpolate when each carbs entry occurred
+     */
+    private fun parseOCRResultsWithTimestamps(visionText: com.google.mlkit.vision.text.Text): List<GraphTreatment> {
+        val treatments = mutableListOf<GraphTreatment>()
+        val timeLabels = mutableListOf<TimeLabel>()
+        val carbsWithPosition = mutableListOf<Triple<Int, Int, String>>() // carbs, xCenter, originalText
+
+        Log.d(TAG, "=== PARSING OCR WITH TIME INTERPOLATION ===")
+
+        // Collect all potential time labels first (to find their Y range)
+        data class PotentialTimeLabel(val hour: Int, val minute: Int, val xCenter: Int, val yTop: Int)
+        val potentialTimeLabels = mutableListOf<PotentialTimeLabel>()
+
+        // First pass: collect all HH:MM patterns with their positions
+        for (block in visionText.textBlocks) {
+            val box = block.boundingBox ?: continue
+            val text = block.text.trim()
+            val xCenter = (box.left + box.right) / 2
+
+            val timeMatch = TIME_PATTERN.find(text)
+            if (timeMatch != null) {
+                val hour = timeMatch.groupValues[1].toIntOrNull() ?: continue
+                val minute = timeMatch.groupValues[2].toIntOrNull() ?: continue
+                potentialTimeLabels.add(PotentialTimeLabel(hour, minute, xCenter, box.top))
+            }
+        }
+
+        // Find the most common Y level for time labels (X-axis labels should be at similar Y)
+        // Group by Y position (within 100px tolerance)
+        val yGroups = potentialTimeLabels.groupBy { (it.yTop / 100) * 100 }
+        val largestYGroup = yGroups.maxByOrNull { it.value.size }?.value ?: emptyList()
+        val timeLabelsYThreshold = if (largestYGroup.isNotEmpty()) {
+            val avgY = largestYGroup.map { it.yTop }.average().toInt()
+            Log.d(TAG, "Detected time labels Y range around Y=$avgY (${largestYGroup.size} labels)")
+            avgY - 100 // Allow some tolerance above
+        } else {
+            Log.d(TAG, "No time label Y range detected, using default")
+            500 // Default threshold
+        }
+
+        // Second pass: extract time labels and carbs markers
+        for (block in visionText.textBlocks) {
+            val box = block.boundingBox ?: continue
+            val text = block.text.trim()
+            val xCenter = (box.left + box.right) / 2
+
+            // Check if this is a time label (at the detected Y level for X-axis)
+            val timeMatch = TIME_PATTERN.find(text)
+            if (timeMatch != null && box.top >= timeLabelsYThreshold) {
+                val hour = timeMatch.groupValues[1].toIntOrNull() ?: continue
+                val minute = timeMatch.groupValues[2].toIntOrNull() ?: continue
+                timeLabels.add(TimeLabel(hour, minute, xCenter))
+                Log.d(TAG, "  Time label found: ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} at X=$xCenter, Y=${box.top}")
+            }
+
+            // Check if this is a carbs marker (above the time labels)
+            val carbsMatch = CARBS_PATTERN.find(text)
+            if (carbsMatch != null && box.top < timeLabelsYThreshold) {
+                val carbsValue = carbsMatch.groupValues[1].toIntOrNull()
+                if (carbsValue != null && carbsValue in 1..200) {
+                    carbsWithPosition.add(Triple(carbsValue, xCenter, text))
+                    Log.d(TAG, "  Carbs marker found: $carbsValue g at X=$xCenter, Y=${box.top} (text: '$text')")
+                }
+            }
+        }
+
+        // Sort time labels by X position (left to right)
+        timeLabels.sortBy { it.xCenter }
+        Log.d(TAG, "Sorted time labels: ${timeLabels.map { "${it.hour}:${it.minute.toString().padStart(2, '0')}@X${it.xCenter}" }}")
+
+        if (timeLabels.size < 2) {
+            Log.d(TAG, "Not enough time labels for interpolation (${timeLabels.size}), skipping carbs")
+            // No fallback - we only upload meals with accurate timestamps
+            return treatments
+        }
+
+        // For each carbs marker, interpolate the time
+        for ((carbs, carbsX, origText) in carbsWithPosition) {
+            val estimatedTime = interpolateTime(carbsX, timeLabels)
+            if (estimatedTime != null) {
+                treatments.add(GraphTreatment(carbsGrams = carbs, timestamp = estimatedTime))
+                val dateStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(estimatedTime))
+                Log.d(TAG, "  → Carbs $carbs g at X=$carbsX → estimated time: $dateStr")
+            } else {
+                Log.d(TAG, "  → Carbs $carbs g: could not interpolate time, skipping")
+                // No fallback - skip this carbs entry
+            }
+        }
+
+        return treatments
+    }
+
+    /**
+     * Interpolates the timestamp based on X position between time labels
+     */
+    private fun interpolateTime(xPos: Int, timeLabels: List<TimeLabel>): Long? {
+        if (timeLabels.size < 2) return null
+
+        // Find the two time labels that bracket this X position
+        var leftLabel: TimeLabel? = null
+        var rightLabel: TimeLabel? = null
+
+        for (i in 0 until timeLabels.size - 1) {
+            if (timeLabels[i].xCenter <= xPos && timeLabels[i + 1].xCenter >= xPos) {
+                leftLabel = timeLabels[i]
+                rightLabel = timeLabels[i + 1]
+                break
+            }
+        }
+
+        // If outside range, extrapolate from nearest pair
+        if (leftLabel == null || rightLabel == null) {
+            if (xPos < timeLabels.first().xCenter) {
+                leftLabel = timeLabels[0]
+                rightLabel = timeLabels[1]
+            } else {
+                leftLabel = timeLabels[timeLabels.size - 2]
+                rightLabel = timeLabels[timeLabels.size - 1]
+            }
+        }
+
+        // Calculate the fraction between the two labels
+        val xRange = rightLabel.xCenter - leftLabel.xCenter
+        if (xRange <= 0) return null
+
+        val fraction = (xPos - leftLabel.xCenter).toDouble() / xRange
+
+        // Convert time labels to minutes since midnight, handling day boundary
+        var leftMinutes = leftLabel.hour * 60 + leftLabel.minute
+        var rightMinutes = rightLabel.hour * 60 + rightLabel.minute
+
+        // Handle day boundary (e.g., 23:00 to 00:00)
+        if (rightMinutes < leftMinutes) {
+            rightMinutes += 24 * 60 // Add a day
+        }
+
+        val interpolatedMinutes = leftMinutes + (rightMinutes - leftMinutes) * fraction
+        val finalMinutes = interpolatedMinutes % (24 * 60)
+
+        val estimatedHour = (finalMinutes / 60).toInt()
+        val estimatedMinute = (finalMinutes % 60).toInt()
+
+        // Build timestamp for today (or yesterday if the time is in the future)
+        val now = java.util.Calendar.getInstance()
+        val estimated = java.util.Calendar.getInstance().apply {
+            set(java.util.Calendar.HOUR_OF_DAY, estimatedHour)
+            set(java.util.Calendar.MINUTE, estimatedMinute)
+            set(java.util.Calendar.SECOND, 0)
+            set(java.util.Calendar.MILLISECOND, 0)
+        }
+
+        // If estimated time is in the future by more than 10 minutes, assume it was yesterday
+        if (estimated.timeInMillis > now.timeInMillis + 10 * 60 * 1000) {
+            estimated.add(java.util.Calendar.DAY_OF_YEAR, -1)
+        }
+
+        Log.d(TAG, "    Interpolation: X=$xPos between ${leftLabel.hour}:${leftLabel.minute.toString().padStart(2,'0')}@${leftLabel.xCenter} " +
+                "and ${rightLabel.hour}:${rightLabel.minute.toString().padStart(2,'0')}@${rightLabel.xCenter} " +
+                "→ fraction=${"%.2f".format(fraction)} → $estimatedHour:${estimatedMinute.toString().padStart(2,'0')}")
+
+        return estimated.timeInMillis
+    }
+
+    /**
+     * Saves the screenshot for debugging with timestamp
+     */
+    private fun saveScreenshotForDebug(
+        bitmap: android.graphics.Bitmap,
+        service: android.accessibilityservice.AccessibilityService,
+        treatments: List<GraphTreatment>
+    ) {
+        try {
+            val dir = service.getExternalFilesDir(null)
+            if (dir != null) {
+                val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault())
+                    .format(java.util.Date())
+                val treatmentInfo = treatments.firstOrNull()?.let {
+                    "_${it.insulinUnits ?: 0}IE_${it.carbsGrams ?: 0}g"
+                } ?: "_no_treatment"
+                val file = java.io.File(dir, "ocr_screenshot_$timestamp$treatmentInfo.png")
+
+                java.io.FileOutputStream(file).use { out ->
+                    bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
+                }
+
+                Log.d(TAG, "✓ Debug screenshot saved: ${file.name}")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Error saving debug screenshot", e)
+        }
+    }
+
+    /**
+     * Data class to track rotate button candidates with their depth
+     */
+    private data class RotateButtonCandidate(
+        val node: AccessibilityNodeInfo,
+        val depth: Int,
+        val viewId: String?
+    )
+
+    /**
+     * Finds the "Rotate screen" / "Bildschirm drehen" button on the main screen.
+     * Multi-language support: DE, EN, FR
+     * Returns the button at the DEEPEST level (most likely to be on the topmost overlay)
+     */
+    private fun findRotateScreenButton(node: AccessibilityNodeInfo, depth: Int = 0): AccessibilityNodeInfo? {
+        val candidates = mutableListOf<RotateButtonCandidate>()
+        collectRotateButtons(node, depth, candidates)
+
+        if (candidates.isEmpty()) {
+            return null
+        }
+
+        // Log all candidates
+        Log.d(TAG, "Found ${candidates.size} rotate button candidate(s):")
+        candidates.forEach { candidate ->
+            Log.d(TAG, "  - depth=${candidate.depth}, viewId=${candidate.viewId}")
+        }
+
+        // Return the one at the deepest depth (most likely on topmost view)
+        val deepest = candidates.maxByOrNull { it.depth }
+        if (deepest != null) {
+            Log.d(TAG, "Selected deepest button at depth=${deepest.depth}, viewId=${deepest.viewId}")
+            return deepest.node
+        }
+
+        return null
+    }
+
+    /**
+     * Collects all rotate button candidates from the node tree
+     */
+    private fun collectRotateButtons(node: AccessibilityNodeInfo, depth: Int, candidates: MutableList<RotateButtonCandidate>) {
+        if (depth > MAX_DEPTH) return
+
+        val contentDesc = node.contentDescription?.toString()?.lowercase() ?: ""
+        val text = node.text?.toString()?.lowercase() ?: ""
+        val viewId = node.viewIdResourceName
+
+        // Multi-language support for rotate screen button
+        if (node.isClickable) {
+            val matches = contentDesc.contains("bildschirm drehen") ||  // DE
+                    contentDesc.contains("rotate screen") ||             // EN
+                    contentDesc.contains("rotation écran") ||            // FR
+                    contentDesc.contains("rotate") ||
+                    contentDesc.contains("landscape") ||
+                    text.contains("bildschirm drehen") ||
+                    text.contains("rotate screen")
+
+            if (matches) {
+                candidates.add(RotateButtonCandidate(node, depth, viewId))
+            }
+        }
+
+        // Check children
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            collectRotateButtons(child, depth + 1, candidates)
+            // Don't recycle child here - it might be added to candidates
+        }
+    }
+
+    /**
+     * Logs all clickable elements in a node tree for exploration.
+     */
+    private fun logAllClickableElements(node: AccessibilityNodeInfo, depth: Int = 0) {
+        if (depth > MAX_DEPTH) return
+
+        val contentDesc = node.contentDescription?.toString() ?: ""
+        val text = node.text?.toString() ?: ""
+        val className = node.className?.toString() ?: ""
+        val viewId = node.viewIdResourceName ?: ""
+
+        if (node.isClickable) {
+            Log.d(TAG, "  Clickable[$depth]: class=$className, viewId=$viewId, desc='$contentDesc', text='$text'")
+        }
+
+        for (i in 0 until node.childCount) {
+            val child = node.getChild(i) ?: continue
+            logAllClickableElements(child, depth + 1)
+        }
+    }
+
+    /**
      * Extract sensor (SAGE) and insulin (IAGE) information from CamAPS FX burger menu.
      * Supports multiple languages:
      * - DE: "Anlage seit", "Füllung seit", "Ende Sensorsitzung"
@@ -663,7 +1312,6 @@ class CamAPSFXReader {
 
             Log.d(TAG, "Found burger menu button, clicking...")
             menuButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            menuButton.recycle()
 
             // Wait for menu to open
             delay(1000)
@@ -782,13 +1430,10 @@ class CamAPSFXReader {
             if (closeButton != null) {
                 Log.d(TAG, "Closing menu...")
                 closeButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-                closeButton.recycle()
             } else {
                 Log.d(TAG, "No close button found, using GLOBAL_ACTION_BACK")
                 service.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
             }
-
-            menuNode.recycle()
 
             // Log results
             if (sensorInfo != null) {
@@ -875,10 +1520,8 @@ class CamAPSFXReader {
             val child = node.getChild(i) ?: continue
             val found = findBurgerMenuButton(child, depth + 1)
             if (found != null) {
-                if (found != child) child.recycle()
                 return found
             }
-            child.recycle()
         }
 
         return null
@@ -913,10 +1556,8 @@ class CamAPSFXReader {
             val child = node.getChild(i) ?: continue
             val found = findBackButton(child, depth + 1)
             if (found != null) {
-                if (found != child) child.recycle()
                 return found
             }
-            child.recycle()
         }
 
         return null

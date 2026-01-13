@@ -106,6 +106,9 @@ dependencies {
     implementation("com.patrykandpatrick.vico:core:1.13.1")
     implementation("com.patrykandpatrick.vico:views:1.13.1")
 
+    // ML Kit Text Recognition (for OCR)
+    implementation("com.google.mlkit:text-recognition:16.0.0")
+
     // Testing
     testImplementation("junit:junit:4.13.2")
     androidTestImplementation("androidx.test.ext:junit:1.1.5")

@@ -14,7 +14,6 @@ import android.widget.RemoteViews
 import com.diabetesscreenreader.DiabetesScreenReaderApp
 import com.diabetesscreenreader.R
 import com.diabetesscreenreader.data.GlucoseReading
-import com.diabetesscreenreader.data.GlucoseRepository
 import com.diabetesscreenreader.data.GlucoseUnit
 import com.diabetesscreenreader.data.RangeStatus
 import com.diabetesscreenreader.service.DiabetesAccessibilityService
@@ -62,11 +61,7 @@ class DiabetesWidgetReceiver : AppWidgetProvider() {
         scope.launch {
             try {
                 val app = context.applicationContext as DiabetesScreenReaderApp
-                val repository = GlucoseRepository(
-                    app.database.glucoseDao(),
-                    app.nightscoutApi,
-                    app.preferencesManager
-                )
+                val repository = app.repository
 
                 val latestReading = repository.getLatestReadingSync()
                 val readings = repository.getLatestReadingsSync(144) // Last 12 hours at 5min intervals

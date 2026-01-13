@@ -13,7 +13,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.logging.HttpLoggingInterceptor
 import java.security.MessageDigest
-import java.text.SimpleDateFormat
+import java.time.Instant
+import java.time.ZoneOffset
+import java.time.format.DateTimeFormatter
 import java.util.*
 import java.util.concurrent.TimeUnit
 
@@ -205,7 +207,7 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     suspend fun uploadTempBasal(basalRate: Double, timestamp: Long): Result<String> {
         val treatment = NightscoutTreatment(
             eventType = "Temp Basal",
-            created_at = isoFormat.format(Date(timestamp)),
+            created_at = formatTimestamp(timestamp),
             date = timestamp,
             duration = 60,  // 60 minutes - will be overwritten by next temp basal
             absolute = basalRate,
@@ -314,7 +316,7 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     suspend fun uploadSensorStart(sensorStartTime: Long, sensorSerial: String? = null): Result<String> {
         val treatment = NightscoutTreatment(
             eventType = "Sensor Start",
-            created_at = isoFormat.format(Date(sensorStartTime)),
+            created_at = formatTimestamp(sensorStartTime),
             date = sensorStartTime,
             device = "loop://CamAPSFX-ScreenReader",
             app = "AndroidAPS",
@@ -377,7 +379,7 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
             if (dateStr.all { it.isDigit() }) {
                 dateStr.toLongOrNull()
             } else {
-                isoFormat.parse(dateStr)?.time
+                Instant.from(isoFormatter.parse(dateStr)).toEpochMilli()
             }
         } catch (e: Exception) {
             Log.e(TAG, "Error parsing date: $dateStr", e)
@@ -426,7 +428,7 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     suspend fun uploadInsulinChange(fillTime: Long): Result<String> {
         val treatment = NightscoutTreatment(
             eventType = "Insulin Change",
-            created_at = isoFormat.format(Date(fillTime)),
+            created_at = formatTimestamp(fillTime),
             date = fillTime,
             device = "loop://CamAPSFX-ScreenReader",
             app = "AndroidAPS",
@@ -534,20 +536,23 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     // Data Converters
     // ════════════════════════════════════════════════════════════════════════════
 
-    private val isoFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'", Locale.US).apply {
-        timeZone = TimeZone.getTimeZone("UTC")
-    }
+    // Thread-safe ISO 8601 formatter
+    private val isoFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss.SSS'Z'")
+        .withZone(ZoneOffset.UTC)
+
+    private fun formatTimestamp(timestamp: Long): String =
+        isoFormatter.format(Instant.ofEpochMilli(timestamp))
 
     private fun GlucoseReading.toNightscoutEntry() = NightscoutEntry(
         sgv = getValueInUnit(GlucoseUnit.MG_DL).toInt(),
         direction = trend.toDirection(),
         date = timestamp,
-        dateString = isoFormat.format(Date(timestamp)),
+        dateString = formatTimestamp(timestamp),
         device = "DiabetesScreenReader/$source"
     )
 
     private fun GlucoseReading.toDeviceStatus(): NightscoutDeviceStatus {
-        val ts = isoFormat.format(Date(timestamp))
+        val ts = formatTimestamp(timestamp)
         return NightscoutDeviceStatus(
             device = "loop://CamAPSFX-ScreenReader",
             created_at = ts,
@@ -594,7 +599,7 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     private fun createTreatment(reading: GlucoseReading, eventType: String, notes: String) =
         NightscoutTreatment(
             eventType = eventType,
-            created_at = isoFormat.format(Date(reading.timestamp)),
+            created_at = formatTimestamp(reading.timestamp),
             date = reading.timestamp,
             device = "loop://CamAPSFX-ScreenReader",
             app = "AndroidAPS",
@@ -606,7 +611,7 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     private fun createBolusTreatment(timestamp: Long, amount: Double) =
         NightscoutTreatment(
             eventType = "Correction Bolus",
-            created_at = isoFormat.format(Date(timestamp)),
+            created_at = formatTimestamp(timestamp),
             date = timestamp,
             device = "loop://CamAPSFX-ScreenReader",
             app = "AndroidAPS",
@@ -617,6 +622,27 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
             isBasalInsulin = false,
             notes = "Bolus von CamAPS FX"
         )
+
+    /**
+     * Upload a meal treatment with carbs to Nightscout
+     * @param carbsGrams Amount of carbohydrates in grams
+     * @param timestamp Optional timestamp (defaults to current time)
+     */
+    suspend fun uploadMealTreatment(carbsGrams: Int, timestamp: Long = System.currentTimeMillis()): Result<String> {
+        val treatment = NightscoutTreatment(
+            eventType = "Meal Bolus",
+            created_at = formatTimestamp(timestamp),
+            date = timestamp,
+            device = "loop://CamAPSFX-ScreenReader",
+            app = "AndroidAPS",
+            enteredBy = "CamAPSFX-ScreenReader",
+            isValid = true,
+            carbs = carbsGrams.toDouble(),
+            notes = "Kohlenhydrate von CamAPS FX Graph (OCR)"
+        )
+        android.util.Log.d(TAG, "Uploading meal treatment: $carbsGrams g at ${formatTimestamp(timestamp)}")
+        return uploadTreatment(treatment)
+    }
 
     private fun GlucoseTrend.toDirection(): String = when (this) {
         GlucoseTrend.DOUBLE_UP -> "DoubleUp"
