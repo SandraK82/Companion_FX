@@ -26,6 +26,7 @@ class DataCollectionService : Service() {
     private val repository: GlucoseRepository by lazy {
         GlucoseRepository(
             app.database.glucoseDao(),
+            app.database.companionEventDao(),
             app.nightscoutApi,
             app.preferencesManager
         )
@@ -61,11 +62,11 @@ class DataCollectionService : Service() {
         syncJob = serviceScope.launch {
             while (isActive) {
                 try {
-                    // Sync unuploaded readings to Nightscout
+                    // Flush durable Companion event rows and the latest pump status
                     val result = repository.syncUnuploadedReadings()
                     result.onSuccess { count ->
                         if (count > 0) {
-                            Log.d(TAG, "Synced $count readings to Nightscout")
+                            Log.d(TAG, "Processed $count Companion events/status updates")
                             updateNotification()
                         }
                     }.onFailure { error ->

@@ -29,7 +29,12 @@ class DiabetesScreenReaderApp : Application() {
     }
 
     val repository: GlucoseRepository by lazy {
-        GlucoseRepository(database.glucoseDao(), nightscoutApi, preferencesManager)
+        GlucoseRepository(
+            database.glucoseDao(),
+            database.companionEventDao(),
+            nightscoutApi,
+            preferencesManager
+        )
     }
 
     override fun onCreate() {

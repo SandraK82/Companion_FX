@@ -46,6 +46,7 @@ class MainActivity : ComponentActivity() {
     private val repository: GlucoseRepository by lazy {
         GlucoseRepository(
             app.database.glucoseDao(),
+            app.database.companionEventDao(),
             app.nightscoutApi,
             app.preferencesManager
         )

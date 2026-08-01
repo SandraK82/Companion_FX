@@ -162,6 +162,7 @@ class LockscreenReadingActivity : Activity() {
         val packageNames = listOf(
             "com.camdiab.fx_alert.mgdl",
             "com.camdiab.fx_alert.mmol",
+            "com.camdiab.fx_alert.mmoll",
             "com.camdiab.fx.camaps"
         )
 

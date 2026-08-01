@@ -38,16 +38,16 @@ class CamAPSFXReader {
         private const val PACKAGE_NAME_MMOL = "com.camdiab.fx_alert.mmol"
         private const val MAX_DEPTH = 20
 
-        // Regex patterns for OCR treatment markers
-        // Carbs pattern: matches "30 g" or "30g" but NOT "mg" or part of "Glukose"
-        // Uses negative lookbehind for 'm' to avoid matching "mg"
-        // Requires word boundary after 'g' to avoid matching "Glukose"
+        // Regex patterns for OCR treatment markers. CamAPS renders these as
+        // both `25g`/`5 g` and `2.5U`/`0,5 IE` depending on locale. Avoid the
+        // `g` in `mg` and the `U` in the basal-rate label `U/h`.
         private val CARBS_PATTERN = Regex("""(?<!m)(\d{1,3})\s*g\b""", RegexOption.IGNORE_CASE)
+        private val INSULIN_PATTERN = Regex(
+            """(?<![\w.])(\d{1,3}(?:[.,]\d{1,2})?)\s*(?:U|IE|UI)(?!\s*/?\s*h)\b""",
+            RegexOption.IGNORE_CASE
+        )
         // Time label pattern: matches "21:00", "23:00", "00:00"
         private val TIME_PATTERN = Regex("""(\d{2}):(\d{2})""")
-
-        // Duplicate detection window: ±30 minutes
-        private const val DUPLICATE_WINDOW_MS = 30 * 60 * 1000L  // 30 minutes
 
         // Check if package belongs to CamAPS FX (any variant)
         fun isCamAPSFXPackage(packageName: String?): Boolean {
@@ -55,39 +55,10 @@ class CamAPSFXReader {
         }
     }
 
-    // Track last sent meal for duplicate detection
-    private var lastSentMealCarbs: Int? = null
-    private var lastSentMealTime: Long = 0L
-
-    // Callback for when OCR finds NEW treatments (after duplicate check)
+    // Callback for OCR discoveries. Room's durable fingerprint ledger is the
+    // duplicate gate; an in-memory "same carbs" gate would incorrectly drop
+    // two legitimate meals with the same carbohydrate amount.
     var onTreatmentFound: ((GraphTreatment) -> Unit)? = null
-
-    /**
-     * Check if a carbs value is a duplicate of the last sent meal
-     * Returns true if this appears to be a duplicate (same carbs within ±30 min)
-     */
-    private fun isDuplicateMeal(carbsGrams: Int): Boolean {
-        val lastCarbs = lastSentMealCarbs ?: return false
-        val timeDiff = kotlin.math.abs(System.currentTimeMillis() - lastSentMealTime)
-
-        // Consider it a duplicate if same carbs amount within the time window
-        val isDuplicate = (carbsGrams == lastCarbs) && (timeDiff < DUPLICATE_WINDOW_MS)
-
-        if (isDuplicate) {
-            Log.d(TAG, "Duplicate meal detected: $carbsGrams g (last: $lastCarbs g, ${timeDiff / 60000}min ago)")
-        }
-
-        return isDuplicate
-    }
-
-    /**
-     * Mark a meal as sent (for duplicate tracking)
-     */
-    private fun markMealAsSent(carbsGrams: Int) {
-        lastSentMealCarbs = carbsGrams
-        lastSentMealTime = System.currentTimeMillis()
-        Log.d(TAG, "Marked meal as sent: $carbsGrams g at ${lastSentMealTime}")
-    }
 
     /**
      * Extract glucose data from CamAPS FX app
@@ -247,24 +218,27 @@ class CamAPSFXReader {
 
         // Now look for glucose value - a standalone number in the glucose range
         // In CamAPS FX, the glucose value is displayed LARGE and standalone
-        val potentialValues = mutableListOf<Int>()
+        val potentialValues = mutableListOf<Double>()
 
         for (text in allText) {
-            // Pattern: standalone number in glucose range
-            val valuePattern = Regex("""^\s*(\d{2,3})\s*$""")
+            // CamAPS displays mmol/L with one decimal. Requiring the decimal
+            // prevents unrelated standalone integers from being treated as glucose.
+            val valuePattern = if (unit == GlucoseUnit.MMOL_L) {
+                Regex("""^\s*(\d{1,2}[.,]\d)\s*$""")
+            } else {
+                Regex("""^\s*(\d{2,3})\s*$""")
+            }
             val match = valuePattern.find(text)
             if (match != null) {
-                val value = match.groupValues[1].toIntOrNull()
-                // CRITICAL: Value must be in valid glucose range AND not zero!
-                if (value != null && value > 0 && value >= 40 && value <= 400) {
+                val value = match.groupValues[1].replace(',', '.').toDoubleOrNull()
+                val validRange = if (unit == GlucoseUnit.MMOL_L) 0.1..40.0 else 40.0..400.0
+                if (value != null && value in validRange) {
                     potentialValues.add(value)
                     Log.d(TAG, "Found potential glucose value: $value from text '$text'")
                 } else if (value != null && value <= 0) {
                     Log.e(TAG, "REJECTED INVALID VALUE: $value (zero or negative - medically impossible!)")
-                } else if (value != null && value < 40) {
-                    Log.e(TAG, "REJECTED INVALID VALUE: $value (below minimum 40 mg/dL)")
-                } else if (value != null && value > 400) {
-                    Log.e(TAG, "REJECTED INVALID VALUE: $value (above maximum 400 mg/dL)")
+                } else if (value != null) {
+                    Log.e(TAG, "REJECTED INVALID VALUE: $value (outside valid $unit range)")
                 }
             }
         }
@@ -279,7 +253,7 @@ class CamAPSFXReader {
             Log.w(TAG, "SAFETY CHECK WARNING: Multiple potential values found: $potentialValues - using first one")
         }
 
-        glucoseValue = potentialValues.first().toDouble()
+        glucoseValue = potentialValues.first()
 
         // CRITICAL FINAL CHECK: Ensure value is not zero before using it
         if (glucoseValue <= 0) {
@@ -287,7 +261,8 @@ class CamAPSFXReader {
             return null
         }
 
-        if (glucoseValue < 40 || glucoseValue > 400) {
+        val finalRange = if (unit == GlucoseUnit.MMOL_L) 0.1..40.0 else 40.0..400.0
+        if (glucoseValue !in finalRange) {
             Log.e(TAG, "CRITICAL SAFETY CHECK FAILED: Final glucose value out of range: $glucoseValue - REJECTING!")
             return null
         }
@@ -328,13 +303,13 @@ class CamAPSFXReader {
                 data["activeInsulin"] = it
             }
 
-            // Basal Rate (DE: Insulinabgaberate, EN: Insulin delivery rate, FR: Debit d'insuline)
-            extractPattern(text, """(?:Insulinabgaberate|Insulin delivery rate|Debit d'insuline):\s*([\d,\.]+)\s*(?:IE|U|UI)/h""")?.let {
+            // Basal Rate (CamAPS currently renders "Insulin infusion rate")
+            extractPattern(text, """(?:Insulinabgaberate|Insulin delivery rate|Insulin infusion rate|Debit d'insuline):\s*([\d,\.]+)\s*(?:IE|U|UI)/h""")?.let {
                 data["basalRate"] = it
             }
 
-            // Reservoir (same in all languages)
-            extractPattern(text, """Reservoir:\s*([\d,\.]+)\s*(?:IE|U|UI)""")?.let {
+            // Reservoir (the English UI prefixes this with "Pump")
+            extractPattern(text, """(?:Reservoir|Pump reservoir):\s*([\d,\.]+)\s*(?:IE|U|UI)""")?.let {
                 data["reservoir"] = it
             }
 
@@ -347,10 +322,10 @@ class CamAPSFXReader {
             // DE: "Bolus: 2,00 IE vor 31 Minuten" / "Bolus: 11,30 IE 5 h 17 min"
             // EN: "Bolus: 2.00 U 31 minutes ago" / "Bolus: 11.30 U 5 h 17 min ago"
             // FR: "Bolus: 2,00 UI il y a 31 minutes"
-            val bolusPatternDE1 = Regex("""Bolus:\s*([\d,\.]+)\s*(?:IE|U|UI)\s*vor\s*(\d+)\s*Minuten""", RegexOption.IGNORE_CASE)
-            val bolusPatternEN1 = Regex("""Bolus:\s*([\d,\.]+)\s*(?:IE|U|UI)\s*(\d+)\s*minutes?\s*ago""", RegexOption.IGNORE_CASE)
-            val bolusPatternFR1 = Regex("""Bolus:\s*([\d,\.]+)\s*(?:IE|U|UI)\s*il y a\s*(\d+)\s*minutes?""", RegexOption.IGNORE_CASE)
-            val bolusPattern2 = Regex("""Bolus:\s*([\d,\.]+)\s*(?:IE|U|UI)\s*(\d+)\s*h\s*(\d+)\s*min""", RegexOption.IGNORE_CASE)
+            val bolusPatternDE1 = Regex("""Bolus:[\s\u00A0]*([\d,\.]+)[\s\u00A0]*(?:IE|U|UI)[\s\u00A0]*vor[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|Minuten?)""", RegexOption.IGNORE_CASE)
+            val bolusPatternEN1 = Regex("""Bolus:[\s\u00A0]*([\d,\.]+)[\s\u00A0]*(?:IE|U|UI)[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|minutes?)[\s\u00A0]*ago""", RegexOption.IGNORE_CASE)
+            val bolusPatternFR1 = Regex("""Bolus:[\s\u00A0]*([\d,\.]+)[\s\u00A0]*(?:IE|U|UI)[\s\u00A0]*il y a[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|minutes?)""", RegexOption.IGNORE_CASE)
+            val bolusPattern2 = Regex("""Bolus:[\s\u00A0]*([\d,\.]+)[\s\u00A0]*(?:IE|U|UI)[\s\u00A0]*(\d+)[\s\u00A0]*h[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|minutes?)""", RegexOption.IGNORE_CASE)
             val bolusPatternNone = Regex("""Bolus:\s*---""", RegexOption.IGNORE_CASE)
 
             // Try patterns in order, stop at first match
@@ -390,11 +365,11 @@ class CamAPSFXReader {
                 Log.d(TAG, "No active bolus (---)")
             }
 
-            // Pump Connection (DE: Pumpenverbindung, EN: Pump connection, FR: Connexion pompe)
-            val pumpConnPatternDE1 = Regex("""(?:Pumpenverbindung|Pump connection|Connexion pompe):\s*vor\s*(\d+)\s*Minuten""", RegexOption.IGNORE_CASE)
+            // Pump Connection (CamAPS currently renders "Pump connect")
+            val pumpConnPatternDE1 = Regex("""(?:Pumpenverbindung|Pump connection|Pump connect|Connexion pompe):[\s\u00A0]*vor[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|Minuten?)""", RegexOption.IGNORE_CASE)
             val pumpConnPatternDE2 = Regex("""(?:Pumpenverbindung|Pump connection|Connexion pompe):\s*vor\s*einer\s*Minute""", RegexOption.IGNORE_CASE)
-            val pumpConnPatternEN = Regex("""(?:Pumpenverbindung|Pump connection|Connexion pompe):\s*(\d+)\s*minutes?\s*ago""", RegexOption.IGNORE_CASE)
-            val pumpConnPatternFR = Regex("""(?:Pumpenverbindung|Pump connection|Connexion pompe):\s*il y a\s*(\d+)\s*minutes?""", RegexOption.IGNORE_CASE)
+            val pumpConnPatternEN = Regex("""(?:Pumpenverbindung|Pump connection|Pump connect|Connexion pompe):[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|minutes?)[\s\u00A0]*ago""", RegexOption.IGNORE_CASE)
+            val pumpConnPatternFR = Regex("""(?:Pumpenverbindung|Pump connection|Pump connect|Connexion pompe):[\s\u00A0]*il y a[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|minutes?)""", RegexOption.IGNORE_CASE)
 
             pumpConnPatternDE1.find(text)?.let { match ->
                 match.groupValues[1].toDoubleOrNull()?.let { data["pumpConnectionMinutesAgo"] = it }
@@ -406,11 +381,11 @@ class CamAPSFXReader {
                 match.groupValues[1].toDoubleOrNull()?.let { data["pumpConnectionMinutesAgo"] = it }
             }
 
-            // Sensor Data (DE: Sensordaten, EN: Sensor data, FR: Donnees capteur)
-            val sensorDataPatternDE1 = Regex("""(?:Sensordaten|Sensor data|Donnees capteur):\s*vor\s*(\d+)\s*Minuten""", RegexOption.IGNORE_CASE)
+            // Sensor Data (accept the abbreviated "min" form as well)
+            val sensorDataPatternDE1 = Regex("""(?:Sensordaten|Sensor data|Donnees capteur):[\s\u00A0]*vor[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|Minuten?)""", RegexOption.IGNORE_CASE)
             val sensorDataPatternDE2 = Regex("""(?:Sensordaten|Sensor data|Donnees capteur):\s*vor\s*einer\s*Minute""", RegexOption.IGNORE_CASE)
-            val sensorDataPatternEN = Regex("""(?:Sensordaten|Sensor data|Donnees capteur):\s*(\d+)\s*minutes?\s*ago""", RegexOption.IGNORE_CASE)
-            val sensorDataPatternFR = Regex("""(?:Sensordaten|Sensor data|Donnees capteur):\s*il y a\s*(\d+)\s*minutes?""", RegexOption.IGNORE_CASE)
+            val sensorDataPatternEN = Regex("""(?:Sensordaten|Sensor data|Donnees capteur):[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|minutes?)[\s\u00A0]*ago""", RegexOption.IGNORE_CASE)
+            val sensorDataPatternFR = Regex("""(?:Sensordaten|Sensor data|Donnees capteur):[\s\u00A0]*il y a[\s\u00A0]*(\d+)[\s\u00A0]*(?:min|minutes?)""", RegexOption.IGNORE_CASE)
 
             sensorDataPatternDE1.find(text)?.let { match ->
                 match.groupValues[1].toDoubleOrNull()?.let { data["sensorDataMinutesAgo"] = it }
@@ -422,9 +397,9 @@ class CamAPSFXReader {
                 match.groupValues[1].toDoubleOrNull()?.let { data["sensorDataMinutesAgo"] = it }
             }
 
-            // Glucose Target (DE: Glukosezielwert, EN: Glucose target, FR: Cible glycemique)
+            // Glucose Target (CamAPS currently renders "Target glucose")
             // Support both mg/dL and mmol/L
-            extractPattern(text, """(?:Glukosezielwert|Glucose target|Cible glycemique):\s*([\d,\.]+)\s*(?:mg/dL|mmol/L)""")?.let {
+            extractPattern(text, """(?:Glukosezielwert|Glucose target|Target glucose|Cible glycemique):\s*([\d,\.]+)\s*(?:mg/dL|mmol/L)""")?.let {
                 data["glucoseTarget"] = it
             }
 
@@ -603,7 +578,7 @@ class CamAPSFXReader {
      */
     private fun extractPattern(text: String, pattern: String): Double? {
         val regex = Regex(pattern, RegexOption.IGNORE_CASE)
-        val match = regex.find(text) ?: return null
+        val match = regex.find(text.replace('\u00A0', ' ')) ?: return null
         val numberStr = match.groupValues.getOrNull(1) ?: return null
         return numberStr.replace(",", ".").toDoubleOrNull()
     }
@@ -677,6 +652,10 @@ class CamAPSFXReader {
      * Data class for sensor information
      */
     data class SensorInfo(
+        // CamAPS displays a Companion CGM identifier beside these values, but
+        // it is not needed for device-age tracking and must not leave the
+        // phone. Keep the field for source compatibility, always passing null
+        // for drawer observations.
         val serialNumber: String?,
         val sensorStartTime: Long,  // Timestamp when sensor was inserted
         val sensorEndTime: Long?,   // Optional: when sensor session ends
@@ -696,7 +675,19 @@ class CamAPSFXReader {
      */
     data class AgeInfo(
         val sensorInfo: SensorInfo?,
-        val insulinInfo: InsulinInfo?
+        val insulinInfo: InsulinInfo?,
+        val observation: DrawerAgeObservation? = null
+    )
+
+    /** Sanitized device-age observation. No sensor/user identifier is kept. */
+    data class DrawerAgeObservation(
+        val observedAt: Long,
+        val sensorStartTime: Long?,
+        val insulinFillTime: Long?,
+        val sensorEndTime: Long?,
+        val source: String,
+        val confidence: Double,
+        val matchedFields: Set<DrawerAgeParser.Field>
     )
 
     /**
@@ -914,25 +905,25 @@ class CamAPSFXReader {
                         Log.d(TAG, "    hasInsulin=${treatment.hasInsulin}, hasCarbs=${treatment.hasCarbs}, hasBoth=${treatment.hasBoth}")
                     }
 
-                    // Process carbs treatments (we only care about carbs for meal entries)
-                    // Take the LAST carbs value found (most recent visible on graph)
-                    val lastCarbsTreatment = treatments.lastOrNull { it.hasCarbs }
-
-                    if (lastCarbsTreatment != null && lastCarbsTreatment.carbsGrams != null) {
-                        val carbsGrams = lastCarbsTreatment.carbsGrams
-                        if (!isDuplicateMeal(carbsGrams)) {
-                            Log.d(TAG, "  → NEW meal found: $carbsGrams g - notifying callback")
-                            markMealAsSent(carbsGrams)
-                            onTreatmentFound?.invoke(lastCarbsTreatment)
-                        } else {
-                            Log.d(TAG, "  → Skipping duplicate meal: $carbsGrams g")
-                        }
+                    // Send every marker through the durable Room ledger. It is
+                    // important not to keep only the last carb marker: insulin-
+                    // only treatments and two meals with the same grams are
+                    // both legitimate events. The stable fingerprint makes
+                    // repeated screen reads idempotent across restarts.
+                    val actionableTreatments = treatments.filter { it.hasCarbs || it.hasInsulin }
+                    if (actionableTreatments.isEmpty()) {
+                        Log.d(TAG, "  → No carbohydrate or insulin treatments to process")
                     } else {
-                        Log.d(TAG, "  → No carbs treatments to process")
+                        actionableTreatments.forEach { treatment ->
+                            Log.d(TAG, "  → Treatment marker: insulin=${treatment.insulinUnits} U, carbs=${treatment.carbsGrams} g; notifying durable ledger")
+                            onTreatmentFound?.invoke(treatment)
+                        }
                     }
 
-                    // Also save screenshot for debugging
-                    saveScreenshotForDebug(bitmap, service, treatments)
+                    // Do not persist screenshots. CamAPS screens contain
+                    // glucose, treatment, and device identifiers; OCR is
+                    // performed in memory and only sanitized event fields
+                    // enter the Room ledger.
                     bitmap.recycle()
 
                     // Close landscape view after OCR
@@ -947,6 +938,81 @@ class CamAPSFXReader {
                 }
         } catch (e: Exception) {
             Log.e(TAG, "Error running OCR", e)
+            bitmap.recycle()
+        }
+    }
+
+    /**
+     * Capture the current CamAPS drawer without writing the image to disk.
+     * The accessibility tree omits the custom-rendered drawer values, so this
+     * is intentionally separate from the graph OCR path above.
+     */
+    private suspend fun captureScreenshotBitmap(
+        service: android.accessibilityservice.AccessibilityService
+    ): android.graphics.Bitmap? {
+        if (android.os.Build.VERSION.SDK_INT < android.os.Build.VERSION_CODES.R) {
+            Log.w(TAG, "Drawer OCR requires API 30+, current: ${android.os.Build.VERSION.SDK_INT}")
+            return null
+        }
+
+        return suspendCancellableCoroutine { continuation ->
+            try {
+                service.takeScreenshot(
+                    android.view.Display.DEFAULT_DISPLAY,
+                    service.mainExecutor,
+                    object : android.accessibilityservice.AccessibilityService.TakeScreenshotCallback {
+                        override fun onSuccess(
+                            screenshot: android.accessibilityservice.AccessibilityService.ScreenshotResult
+                        ) {
+                            var hardwareBitmap: android.graphics.Bitmap? = null
+                            try {
+                                hardwareBitmap = android.graphics.Bitmap.wrapHardwareBuffer(
+                                    screenshot.hardwareBuffer,
+                                    screenshot.colorSpace
+                                )
+                                val bitmap = hardwareBitmap?.copy(
+                                    android.graphics.Bitmap.Config.ARGB_8888,
+                                    false
+                                )
+                                if (continuation.isActive) continuation.resume(bitmap)
+                            } catch (error: Exception) {
+                                Log.e(TAG, "Could not convert CamAPS drawer screenshot", error)
+                                if (continuation.isActive) continuation.resume(null)
+                            } finally {
+                                hardwareBitmap?.recycle()
+                                screenshot.hardwareBuffer.close()
+                            }
+                        }
+
+                        override fun onFailure(errorCode: Int) {
+                            Log.w(TAG, "CamAPS drawer screenshot failed: $errorCode")
+                            if (continuation.isActive) continuation.resume(null)
+                        }
+                    }
+                )
+            } catch (error: Exception) {
+                Log.e(TAG, "Could not request CamAPS drawer screenshot", error)
+                if (continuation.isActive) continuation.resume(null)
+            }
+        }
+    }
+
+    /** Run ML Kit OCR and return only text; the bitmap is always released. */
+    private suspend fun recognizeDrawerText(bitmap: android.graphics.Bitmap): String? {
+        val recognizer = TextRecognition.getClient(TextRecognizerOptions.DEFAULT_OPTIONS)
+        return try {
+            suspendCancellableCoroutine { continuation ->
+                recognizer.process(InputImage.fromBitmap(bitmap, 0))
+                    .addOnSuccessListener { text ->
+                        if (continuation.isActive) continuation.resume(text.text)
+                    }
+                    .addOnFailureListener { error ->
+                        Log.e(TAG, "CamAPS drawer OCR failed", error)
+                        if (continuation.isActive) continuation.resume(null)
+                    }
+            }
+        } finally {
+            recognizer.close()
             bitmap.recycle()
         }
     }
@@ -1000,13 +1066,16 @@ class CamAPSFXReader {
     )
 
     /**
-     * Parses OCR text blocks to find carbs (g) values with their estimated timestamps
-     * Uses the X position of time labels to interpolate when each carbs entry occurred
+     * Parses OCR text blocks to find carbohydrate and insulin markers with
+     * estimated timestamps. CamAPS places the `g` and `U` labels at the same
+     * x-coordinate for a meal, so nearby markers are combined into one durable
+     * event before they reach Room/Nocturne.
      */
     private fun parseOCRResultsWithTimestamps(visionText: com.google.mlkit.vision.text.Text): List<GraphTreatment> {
         val treatments = mutableListOf<GraphTreatment>()
         val timeLabels = mutableListOf<TimeLabel>()
-        val carbsWithPosition = mutableListOf<Triple<Int, Int, String>>() // carbs, xCenter, originalText
+        val carbsWithPosition = mutableListOf<Pair<Int, Int>>() // carbs, xCenter
+        val insulinWithPosition = mutableListOf<Pair<Double, Int>>() // insulin units, xCenter
 
         Log.d(TAG, "=== PARSING OCR WITH TIME INTERPOLATION ===")
 
@@ -1056,13 +1125,27 @@ class CamAPSFXReader {
                 Log.d(TAG, "  Time label found: ${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')} at X=$xCenter, Y=${box.top}")
             }
 
-            // Check if this is a carbs marker (above the time labels)
+            // Check if this is a carbohydrate marker (above the time labels)
             val carbsMatch = CARBS_PATTERN.find(text)
             if (carbsMatch != null && box.top < timeLabelsYThreshold) {
                 val carbsValue = carbsMatch.groupValues[1].toIntOrNull()
                 if (carbsValue != null && carbsValue in 1..200) {
-                    carbsWithPosition.add(Triple(carbsValue, xCenter, text))
+                    carbsWithPosition.add(carbsValue to xCenter)
                     Log.d(TAG, "  Carbs marker found: $carbsValue g at X=$xCenter, Y=${box.top} (text: '$text')")
+                }
+            }
+
+            // Check if this is an insulin marker. Do not treat the U in the
+            // basal-axis label `U/h` as a bolus marker.
+            INSULIN_PATTERN.find(text)?.let { insulinMatch ->
+                if (box.top < timeLabelsYThreshold) {
+                    val insulinValue = insulinMatch.groupValues[1]
+                        .replace(',', '.')
+                        .toDoubleOrNull()
+                    if (insulinValue != null && insulinValue in 0.01..100.0) {
+                        insulinWithPosition.add(insulinValue to xCenter)
+                        Log.d(TAG, "  Insulin marker found: $insulinValue U at X=$xCenter, Y=${box.top} (text: '$text')")
+                    }
                 }
             }
         }
@@ -1072,21 +1155,49 @@ class CamAPSFXReader {
         Log.d(TAG, "Sorted time labels: ${timeLabels.map { "${it.hour}:${it.minute.toString().padStart(2, '0')}@X${it.xCenter}" }}")
 
         if (timeLabels.size < 2) {
-            Log.d(TAG, "Not enough time labels for interpolation (${timeLabels.size}), skipping carbs")
-            // No fallback - we only upload meals with accurate timestamps
+            Log.d(TAG, "Not enough time labels for interpolation (${timeLabels.size}), skipping graph treatments")
+            // No fallback - only upload graph events with a bounded timestamp.
             return treatments
         }
 
-        // For each carbs marker, interpolate the time
-        for ((carbs, carbsX, origText) in carbsWithPosition) {
-            val estimatedTime = interpolateTime(carbsX, timeLabels)
-            if (estimatedTime != null) {
-                treatments.add(GraphTreatment(carbsGrams = carbs, timestamp = estimatedTime))
-                val dateStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(estimatedTime))
-                Log.d(TAG, "  → Carbs $carbs g at X=$carbsX → estimated time: $dateStr")
+        // Combine an insulin marker and carbohydrate marker when they are
+        // visually aligned. A separate marker remains a separate event.
+        data class Marker(val xCenter: Int, val insulinUnits: Double?, val carbsGrams: Int?)
+        val pairedCarbs = mutableSetOf<Int>()
+        val markers = mutableListOf<Marker>()
+        for ((insulin, insulinX) in insulinWithPosition) {
+            val nearest = carbsWithPosition
+                .withIndex()
+                .filter { it.index !in pairedCarbs }
+                .minByOrNull { kotlin.math.abs(it.value.second - insulinX) }
+            if (nearest != null && kotlin.math.abs(nearest.value.second - insulinX) <= 90) {
+                pairedCarbs.add(nearest.index)
+                markers.add(Marker(insulinX, insulin, nearest.value.first))
             } else {
-                Log.d(TAG, "  → Carbs $carbs g: could not interpolate time, skipping")
-                // No fallback - skip this carbs entry
+                markers.add(Marker(insulinX, insulin, null))
+            }
+        }
+        carbsWithPosition.forEachIndexed { index, (carbs, carbsX) ->
+            if (index !in pairedCarbs) markers.add(Marker(carbsX, null, carbs))
+        }
+        markers.sortBy { it.xCenter }
+
+        // Interpolate timestamps for every marker.
+        for (marker in markers) {
+            val estimatedTime = interpolateTime(marker.xCenter, timeLabels)
+            if (estimatedTime != null) {
+                treatments.add(
+                    GraphTreatment(
+                        insulinUnits = marker.insulinUnits,
+                        carbsGrams = marker.carbsGrams,
+                        timestamp = estimatedTime
+                    )
+                )
+                val dateStr = java.text.SimpleDateFormat("HH:mm", java.util.Locale.getDefault()).format(java.util.Date(estimatedTime))
+                Log.d(TAG, "  → insulin=${marker.insulinUnits} U, carbs=${marker.carbsGrams} g at X=${marker.xCenter} → estimated time: $dateStr")
+            } else {
+                Log.d(TAG, "  → graph marker at X=${marker.xCenter}: could not interpolate time, skipping")
+                // No fallback - skip this marker rather than inventing a time.
             }
         }
 
@@ -1162,35 +1273,6 @@ class CamAPSFXReader {
                 "→ fraction=${"%.2f".format(fraction)} → $estimatedHour:${estimatedMinute.toString().padStart(2,'0')}")
 
         return estimated.timeInMillis
-    }
-
-    /**
-     * Saves the screenshot for debugging with timestamp
-     */
-    private fun saveScreenshotForDebug(
-        bitmap: android.graphics.Bitmap,
-        service: android.accessibilityservice.AccessibilityService,
-        treatments: List<GraphTreatment>
-    ) {
-        try {
-            val dir = service.getExternalFilesDir(null)
-            if (dir != null) {
-                val timestamp = java.text.SimpleDateFormat("yyyyMMdd_HHmmss", java.util.Locale.getDefault())
-                    .format(java.util.Date())
-                val treatmentInfo = treatments.firstOrNull()?.let {
-                    "_${it.insulinUnits ?: 0}IE_${it.carbsGrams ?: 0}g"
-                } ?: "_no_treatment"
-                val file = java.io.File(dir, "ocr_screenshot_$timestamp$treatmentInfo.png")
-
-                java.io.FileOutputStream(file).use { out ->
-                    bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, out)
-                }
-
-                Log.d(TAG, "✓ Debug screenshot saved: ${file.name}")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error saving debug screenshot", e)
-        }
     }
 
     /**
@@ -1300,10 +1382,10 @@ class CamAPSFXReader {
         rootNode: AccessibilityNodeInfo,
         service: android.accessibilityservice.AccessibilityService
     ): AgeInfo? {
+        var menuNode: AccessibilityNodeInfo? = null
         try {
             Log.d(TAG, "=== Starting SAGE/IAGE Extraction ===")
 
-            // Step 1: Find and click burger menu button
             val menuButton = findBurgerMenuButton(rootNode)
             if (menuButton == null) {
                 Log.w(TAG, "Could not find burger menu button")
@@ -1313,148 +1395,111 @@ class CamAPSFXReader {
             Log.d(TAG, "Found burger menu button, clicking...")
             menuButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
 
-            // Wait for menu to open
-            delay(1000)
-
-            // Step 2: Get the menu content
-            val menuNode = service.rootInActiveWindow
+            // Allow the custom drawer to finish drawing before reading it.
+            delay(900)
+            menuNode = service.rootInActiveWindow
             if (menuNode == null) {
                 Log.w(TAG, "Could not get menu window")
                 return null
             }
 
-            // Step 3: Collect all text from menu
             val allText = mutableListOf<String>()
             collectAllText(menuNode, allText)
 
-            Log.d(TAG, "=== Burger Menu Text (${allText.size} items) ===")
-            allText.forEachIndexed { index, text ->
-                Log.d(TAG, "  Menu[$index]: '$text'")
-            }
+            // The custom drawer values are absent from this tree on the
+            // current CamAPS build. Use any accessible text as a cheap first
+            // pass, then OCR the visible drawer when either required field is
+            // missing. The screenshot is processed in memory and discarded.
+            val observedAt = System.currentTimeMillis()
+            val accessibleParsed = DrawerAgeParser.parse(allText.joinToString("\n"))
+            var parsed = accessibleParsed
+            var source = "camaps_drawer_accessibility"
 
-            // Step 4: Look for sensor and insulin information
-            var sensorInfo: SensorInfo? = null
-            var insulinInfo: InsulinInfo? = null
-            var serialNumber: String? = null
+            val needsDrawerOcr = DrawerAgeParser.Field.INSERTION !in parsed.matchedFields ||
+                DrawerAgeParser.Field.REFILL !in parsed.matchedFields ||
+                DrawerAgeParser.Field.EXPIRY !in parsed.matchedFields
 
-            // Multi-language patterns for SAGE (sensor age)
-            val sageLabels = listOf(
-                "Anlage seit",           // DE: Insertion since
-                "Inserted since",        // EN
-                "Insertion depuis",      // FR
-                "Sensor since",          // EN alternative
-                "Capteur depuis"         // FR alternative
-            )
-
-            // Multi-language patterns for IAGE (insulin/reservoir age)
-            val iageLabels = listOf(
-                "Füllung seit",          // DE: Filled since
-                "Filled since",          // EN
-                "Remplissage depuis",    // FR
-                "Reservoir since",       // EN alternative
-                "Réservoir depuis"       // FR alternative
-            )
-
-            // Multi-language patterns for sensor session end
-            val sensorEndLabels = listOf(
-                "Ende Sensorsitzung",    // DE
-                "Sensor session end",    // EN
-                "Fin session capteur"    // FR
-            )
-
-            // Parse menu items - label and value might be in separate items
-            for (i in allText.indices) {
-                val text = allText[i]
-                val nextText = allText.getOrNull(i + 1) ?: ""
-
-                // Extract sensor type (Companion CGM, Freestyle Libre, Dexcom, etc.)
-                if (text.contains("Companion CGM", ignoreCase = true) ||
-                    text.contains("Freestyle Libre", ignoreCase = true) ||
-                    text.contains("Dexcom", ignoreCase = true) ||
-                    text.contains("Libre", ignoreCase = true)) {
-                    // Next item might be the name/serial
-                    val sinceKeywords = listOf("seit", "since", "depuis")
-                    if (nextText.isNotBlank() && sinceKeywords.none { nextText.contains(it, ignoreCase = true) }) {
-                        serialNumber = nextText
-                        Log.d(TAG, "Found sensor: '$text', name/serial: $serialNumber")
-                    }
-                }
-
-                // SAGE: Look for sensor insertion labels
-                if (sageLabels.any { text.equals(it, ignoreCase = true) }) {
-                    val duration = parseDuration(nextText)
-                    if (duration != null) {
-                        val sensorStartTime = System.currentTimeMillis() - duration
-
-                        Log.d(TAG, "Found SAGE label '$text': '$nextText' = ${duration}ms ago")
-                        Log.d(TAG, "Calculated sensor start time: $sensorStartTime")
-
-                        sensorInfo = SensorInfo(
-                            serialNumber = serialNumber,
-                            sensorStartTime = sensorStartTime,
-                            sensorEndTime = null,
-                            durationText = nextText
+            if (needsDrawerOcr) {
+                val bitmap = captureScreenshotBitmap(service)
+                if (bitmap != null) {
+                    val ocrText = recognizeDrawerText(bitmap)
+                    if (!ocrText.isNullOrBlank()) {
+                        val ocrParsed = DrawerAgeParser.parse(ocrText)
+                        parsed = DrawerAgeParser.ParsedAge(
+                            insertionAgeMs = accessibleParsed.insertionAgeMs ?: ocrParsed.insertionAgeMs,
+                            refillAgeMs = accessibleParsed.refillAgeMs ?: ocrParsed.refillAgeMs,
+                            expiryInMs = accessibleParsed.expiryInMs ?: ocrParsed.expiryInMs,
+                            matchedFields = accessibleParsed.matchedFields + ocrParsed.matchedFields,
+                            confidence = maxOf(accessibleParsed.confidence, ocrParsed.confidence)
                         )
-                    }
-                }
-
-                // SAGE: Look for sensor session end labels
-                if (sensorEndLabels.any { text.equals(it, ignoreCase = true) }) {
-                    val duration = parseDuration(nextText)
-                    if (duration != null) {
-                        val sensorEndTime = System.currentTimeMillis() + duration
-                        Log.d(TAG, "Found sensor end label '$text': '$nextText' = in ${duration}ms")
-                        sensorInfo = sensorInfo?.copy(sensorEndTime = sensorEndTime)
-                    }
-                }
-
-                // IAGE: Look for insulin/reservoir fill labels
-                if (iageLabels.any { text.equals(it, ignoreCase = true) }) {
-                    val duration = parseDuration(nextText)
-                    if (duration != null) {
-                        val fillTime = System.currentTimeMillis() - duration
-
-                        Log.d(TAG, "Found IAGE label '$text': '$nextText' = ${duration}ms ago")
-                        Log.d(TAG, "Calculated insulin fill time: $fillTime")
-
-                        insulinInfo = InsulinInfo(
-                            fillTime = fillTime,
-                            durationText = nextText
-                        )
+                        if (ocrParsed.matchedFields.isNotEmpty()) source = "camaps_drawer_ocr"
                     }
                 }
             }
 
-            // Step 5: Close the menu (press back or find close button)
-            val closeButton = findCloseButton(menuNode) ?: findBackButton(menuNode)
-            if (closeButton != null) {
-                Log.d(TAG, "Closing menu...")
-                closeButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
-            } else {
-                Log.d(TAG, "No close button found, using GLOBAL_ACTION_BACK")
-                service.performGlobalAction(android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK)
+            val maxAgeMs = 31L * 24 * 60 * 60 * 1000
+            fun boundedAge(ageMs: Long?): Long? = ageMs?.takeIf { it in 0..maxAgeMs }
+            fun durationText(ageMs: Long): String = "${ageMs / 60_000L} min"
+
+            val insertionAgeMs = boundedAge(parsed.insertionAgeMs)
+            val refillAgeMs = boundedAge(parsed.refillAgeMs)
+            val expiryInMs = boundedAge(parsed.expiryInMs)
+            val sensorStartTime = insertionAgeMs?.let { observedAt - it }
+            val insulinFillTime = refillAgeMs?.let { observedAt - it }
+            val sensorEndTime = expiryInMs?.let { observedAt + it }
+
+            val sensorInfo = sensorStartTime?.let {
+                SensorInfo(
+                    serialNumber = null,
+                    sensorStartTime = it,
+                    sensorEndTime = sensorEndTime,
+                    durationText = durationText(insertionAgeMs)
+                )
+            }
+            val insulinInfo = insulinFillTime?.let {
+                InsulinInfo(
+                    fillTime = it,
+                    durationText = durationText(refillAgeMs)
+                )
             }
 
-            // Log results
-            if (sensorInfo != null) {
-                Log.d(TAG, "✓ SAGE extracted: serial=${sensorInfo.serialNumber}, " +
-                        "startTime=${sensorInfo.sensorStartTime}, duration=${sensorInfo.durationText}")
-            } else {
-                Log.w(TAG, "Could not find SAGE in menu")
-            }
+            if (sensorInfo == null) Log.w(TAG, "Could not find sensor insertion age in CamAPS drawer")
+            if (insulinInfo == null) Log.w(TAG, "Could not find insulin refill age in CamAPS drawer")
 
-            if (insulinInfo != null) {
-                Log.d(TAG, "✓ IAGE extracted: fillTime=${insulinInfo.fillTime}, " +
-                        "duration=${insulinInfo.durationText}")
-            } else {
-                Log.w(TAG, "Could not find IAGE in menu")
-            }
-
-            return AgeInfo(sensorInfo, insulinInfo)
+            return AgeInfo(
+                sensorInfo = sensorInfo,
+                insulinInfo = insulinInfo,
+                observation = DrawerAgeObservation(
+                    observedAt = observedAt,
+                    sensorStartTime = sensorStartTime,
+                    insulinFillTime = insulinFillTime,
+                    sensorEndTime = sensorEndTime,
+                    source = source,
+                    confidence = parsed.confidence,
+                    matchedFields = parsed.matchedFields
+                )
+            )
 
         } catch (e: Exception) {
             Log.e(TAG, "Error extracting age info", e)
             return null
+        } finally {
+            // Always close the drawer, including OCR and cancellation errors.
+            val openMenu = menuNode
+            if (openMenu != null) {
+                try {
+                    val closeButton = findCloseButton(openMenu) ?: findBackButton(openMenu)
+                    if (closeButton != null) {
+                        closeButton.performAction(AccessibilityNodeInfo.ACTION_CLICK)
+                    } else {
+                        service.performGlobalAction(
+                            android.accessibilityservice.AccessibilityService.GLOBAL_ACTION_BACK
+                        )
+                    }
+                } catch (closeError: Exception) {
+                    Log.w(TAG, "Could not close CamAPS drawer", closeError)
+                }
+            }
         }
     }
 
