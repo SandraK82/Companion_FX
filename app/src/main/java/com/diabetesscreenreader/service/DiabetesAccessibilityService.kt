@@ -12,6 +12,7 @@ import android.content.Context
 import android.content.Intent
 import android.content.IntentFilter
 import android.os.Build
+import android.os.BatteryManager
 import android.os.PowerManager
 import android.os.SystemClock
 import android.util.Log
@@ -22,10 +23,10 @@ import com.diabetesscreenreader.DiabetesScreenReaderApp
 import com.diabetesscreenreader.R
 import com.diabetesscreenreader.data.GlucoseReading
 import com.diabetesscreenreader.data.GlucoseRepository
+import com.diabetesscreenreader.data.GlucoseUnit
 import com.diabetesscreenreader.ui.MainActivity
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.first
-import kotlin.math.abs
 import kotlin.math.min
 
 class DiabetesAccessibilityService : AccessibilityService() {
@@ -106,9 +107,6 @@ class DiabetesAccessibilityService : AccessibilityService() {
     private var readingStartTime = 0L
     private var healthCheckJob: Job? = null
 
-    // Track last saved bolus to prevent duplicates (amount, approximate timestamp)
-    private var lastSavedBolus: Pair<Double, Long>? = null
-
     // Track when we last checked SAGE (Sensor Age)
     private var lastSageCheckTime = 0L
 
@@ -121,6 +119,7 @@ class DiabetesAccessibilityService : AccessibilityService() {
     private val repository: GlucoseRepository by lazy {
         GlucoseRepository(
             app.database.glucoseDao(),
+            app.database.companionEventDao(),
             app.nightscoutApi,
             app.preferencesManager
         )
@@ -136,7 +135,8 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
         instance = this
 
-        // Set up OCR treatment callback to upload carbs to Nightscout
+        // Set up OCR treatment callback.  OCR discoveries enter the same
+        // durable ledger as dialog events; they are not uploaded directly.
         setupOCRTreatmentCallback()
 
         // Initialize AlarmManager for periodic reading
@@ -148,33 +148,21 @@ class DiabetesAccessibilityService : AccessibilityService() {
     }
 
     /**
-     * Sets up the callback for when OCR detects carbs in the landscape graph.
-     * When carbs are found, they are uploaded to Nightscout as a meal treatment.
+     * Sets up the callback for when OCR detects treatment markers in the
+     * landscape graph.  The event is persisted first, then the normal retry
+     * path uploads it with a stable syncIdentifier.
      */
     private fun setupOCRTreatmentCallback() {
         camapsFXReader.onTreatmentFound = { treatment ->
-            val carbs = treatment.carbsGrams
-            if (carbs != null && carbs > 0) {
-                Log.d(TAG, "OCR detected carbs: $carbs g - uploading to Nightscout")
-                serviceScope.launch {
-                    try {
-                        // Check if Nightscout is enabled
-                        val nightscoutEnabled = app.preferencesManager.nightscoutEnabled.first()
-                        if (!nightscoutEnabled) {
-                            Log.d(TAG, "Nightscout disabled, skipping meal upload")
-                            return@launch
-                        }
-
-                        // Upload meal treatment
-                        val result = app.nightscoutApi.uploadMealTreatment(carbs, treatment.timestamp)
-                        result.onSuccess {
-                            Log.d(TAG, "✓ Meal uploaded to Nightscout: $carbs g")
-                        }.onFailure { e ->
-                            Log.e(TAG, "Failed to upload meal to Nightscout: ${e.message}")
-                        }
-                    } catch (e: Exception) {
-                        Log.e(TAG, "Error uploading meal to Nightscout", e)
+            serviceScope.launch {
+                try {
+                    repository.recordGraphTreatment(treatment)
+                    val result = repository.flushPendingCompanionEvents()
+                    result.onFailure { error ->
+                        Log.w(TAG, "OCR treatment queued for retry: ${error.message}")
                     }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Error recording OCR treatment", e)
                 }
             }
         }
@@ -229,7 +217,17 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
         alarmManager?.let { am ->
             alarmPendingIntent?.let { pi ->
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S && !am.canScheduleExactAlarms()) {
+                    // Android 12+ may deny exact-alarm access even when the permission is
+                    // declared. Fall back gracefully instead of crashing the accessibility
+                    // service; exact-alarm access can still be granted for tighter timing.
+                    am.setAndAllowWhileIdle(
+                        AlarmManager.ELAPSED_REALTIME_WAKEUP,
+                        triggerTime,
+                        pi
+                    )
+                    Log.w(TAG, "Exact alarm access unavailable; scheduled an inexact reading")
+                } else if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M) {
                     am.setExactAndAllowWhileIdle(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerTime, pi)
                 } else {
                     am.setExact(AlarmManager.ELAPSED_REALTIME_WAKEUP, triggerTime, pi)
@@ -294,10 +292,11 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
         if (powerManager.isInteractive && !keyguardManager.isKeyguardLocked && didWakeScreen) {
             // Screen is on and unlocked, but we're the ones who woke it
-            // This might be a stuck state if no reading is happening
+            // This might be a stuck state if no reading is happening. Do not
+            // force-lock the phone: a secure keyguard would block the next
+            // background cycle. Let Android apply the user's normal timeout.
             if (!isReadingInProgress) {
-                Log.w(TAG, "WATCHDOG: Screen on and unlocked without active reading - locking")
-                lockScreen()
+                Log.w(TAG, "WATCHDOG: Screen on and unlocked without active reading - clearing wake state")
                 didWakeScreen = false
             }
         }
@@ -305,7 +304,7 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
     /**
      * Performs automatic recovery from a stuck state.
-     * Resets all state and ensures the screen is locked.
+     * Resets all state and lets the normal Android screen timeout take over.
      */
     private fun performAutoRecovery(reason: String) {
         Log.w(TAG, "AUTO-RECOVERY triggered: $reason")
@@ -315,10 +314,11 @@ class DiabetesAccessibilityService : AccessibilityService() {
             isReadingInProgress = false
             readingStartTime = 0L
 
-            // Lock screen if we woke it
+            // Clear the wake marker. Do not call GLOBAL_ACTION_LOCK_SCREEN:
+            // with a PIN/password that would strand the next reading cycle at
+            // the keyguard.
             if (didWakeScreen) {
-                Log.d(TAG, "AUTO-RECOVERY: Locking screen")
-                lockScreen()
+                Log.d(TAG, "AUTO-RECOVERY: clearing wake state (no forced lock)")
                 didWakeScreen = false
             }
 
@@ -386,35 +386,6 @@ class DiabetesAccessibilityService : AccessibilityService() {
         }
     }
 
-    private fun deduplicateBolus(reading: GlucoseReading): GlucoseReading {
-        // If no bolus data, nothing to deduplicate
-        if (reading.bolusAmount == null || reading.bolusMinutesAgo == null) {
-            return reading
-        }
-
-        // Calculate approximate timestamp when bolus was given
-        val currentTime = System.currentTimeMillis()
-        val bolusTimestamp = currentTime - (reading.bolusMinutesAgo * 60 * 1000L)
-
-        // Check if this is the same bolus we already saved
-        val isDuplicate = lastSavedBolus?.let { (savedAmount, savedTimestamp) ->
-            // Same bolus if: same amount AND timestamp within 2 minutes
-            savedAmount == reading.bolusAmount &&
-            abs(savedTimestamp - bolusTimestamp) < 120_000L
-        } ?: false
-
-        return if (isDuplicate) {
-            // Remove bolus data from this reading (already saved)
-            Log.d(TAG, "Skipping duplicate bolus: ${reading.bolusAmount} IE (already saved)")
-            reading.copy(bolusAmount = null, bolusMinutesAgo = null)
-        } else {
-            // New bolus - save it and track it
-            Log.d(TAG, "New bolus detected: ${reading.bolusAmount} IE (${reading.bolusMinutesAgo} min ago)")
-            lastSavedBolus = Pair(reading.bolusAmount, bolusTimestamp)
-            reading
-        }
-    }
-
     private suspend fun performPeriodicReading() {
         val intervalMinutes = app.preferencesManager.readingIntervalMinutes.first()
         val normalDelayMs = intervalMinutes * 60 * 1000L
@@ -437,18 +408,28 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
                 Log.d(TAG, "Starting periodic reading...")
 
-                // Check if screen is locked
+                // The accessibility tree is not available while the display is
+                // asleep, even when the phone has no secure keyguard. Wake the
+                // screen for the short CamAPS read; the normal Android timeout
+                // will turn it off again afterwards.
+                val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
                 val keyguardManager = getSystemService(Context.KEYGUARD_SERVICE) as KeyguardManager
                 val wasLocked = keyguardManager.isKeyguardLocked
+                val wasScreenOff = !powerManager.isInteractive
 
-                if (wasLocked) {
-                    Log.d(TAG, "Screen locked - waking up and unlocking...")
+                if (wasLocked || wasScreenOff) {
+                    if (wasLocked) {
+                        Log.d(TAG, "Screen locked - waking up and unlocking...")
+                    } else {
+                        Log.d(TAG, "Screen off - waking display for CamAPS read...")
+                    }
                     didWakeScreen = true
                     startLockscreenReading()
 
-                    // Wait for lockscreen to dismiss (max 10 seconds)
+                    // Wait for the display to wake and (if present) the
+                    // lockscreen to dismiss (max 10 seconds).
                     var waitedMs = 0L
-                    while (keyguardManager.isKeyguardLocked && waitedMs < 10_000L) {
+                    while ((keyguardManager.isKeyguardLocked || !powerManager.isInteractive) && waitedMs < 10_000L) {
                         delay(500)
                         waitedMs += 500
                     }
@@ -458,7 +439,12 @@ class DiabetesAccessibilityService : AccessibilityService() {
                         return@withTimeout
                     }
 
-                    Log.d(TAG, "Screen unlocked after ${waitedMs}ms - now reading")
+                    if (!powerManager.isInteractive) {
+                        Log.w(TAG, "Screen did not wake after 10s - skipping reading")
+                        return@withTimeout
+                    }
+
+                    Log.d(TAG, "Display ready after ${waitedMs}ms - now reading")
                     delay(1000) // Extra wait for CamAPS FX to be ready
                 }
 
@@ -499,15 +485,12 @@ class DiabetesAccessibilityService : AccessibilityService() {
             // CRITICAL: Always clean up state, even on error/timeout
             Log.d(TAG, "Cleaning up reading state...")
 
-            // Lock screen if we woke it (must happen regardless of success/failure)
+            // Never force-lock after a background read. A secure keyguard
+            // would prevent the next cycle from reaching CamAPS. Android's
+            // normal screen timeout still turns the display off, while a
+            // lockscreen-free companion phone can be woken again later.
             if (didWakeScreen) {
-                Log.d(TAG, "Locking screen after reading (finally block)...")
-                try {
-                    delay(500) // Brief delay before locking
-                    lockScreen()
-                } catch (e: Exception) {
-                    Log.e(TAG, "Error locking screen in finally block", e)
-                }
+                Log.d(TAG, "Reading cycle finished; leaving screen to normal timeout (no forced lock)")
                 didWakeScreen = false
             }
 
@@ -567,8 +550,8 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
         return NotificationCompat.Builder(this, DiabetesScreenReaderApp.LOCKSCREEN_READING_CHANNEL_ID)
             .setSmallIcon(R.drawable.ic_launcher_foreground)
-            .setContentTitle("Glukose-Abfrage läuft")
-            .setContentText("Liest Daten von CamAPS FX...")
+            .setContentTitle("Glucose reading in progress")
+            .setContentText("Reading data from CamAPS FX...")
             .setPriority(NotificationCompat.PRIORITY_HIGH)
             .setCategory(NotificationCompat.CATEGORY_ALARM)
             .setAutoCancel(true)
@@ -721,20 +704,33 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
         if (glucoseData != null) {
             // Validate data
+            val validRange = if (glucoseData.unit == GlucoseUnit.MMOL_L) {
+                // Keep genuine low readings instead of using the normal target
+                // range as a validity gate. The native CamAPS/xDrip alarms
+                // remain authoritative for treatment decisions.
+                0.1..40.0
+            } else {
+                40.0..400.0
+            }
             if (glucoseData.value <= 0) {
                 Log.e(TAG, "CRITICAL: Rejecting invalid value: ${glucoseData.value}")
-            } else if (glucoseData.value < 40 || glucoseData.value > 400) {
+            } else if (glucoseData.value !in validRange) {
                 Log.e(TAG, "CRITICAL: Rejecting out-of-range value: ${glucoseData.value}")
             } else {
                 // Save data
                 lastReadingTime = System.currentTimeMillis()
                 lastReadingValue = glucoseData.value
 
-                // Check if bolus is a duplicate and remove it if necessary
-                val finalData = deduplicateBolus(glucoseData)
+                // Persist treatment/device events before the network call.  A
+                // repeated screen read resolves to the same fingerprint and
+                // is ignored by Room, while a failed upload remains pending.
+                val readingWithUploaderBattery = glucoseData.copy(
+                    uploaderBattery = readUploaderBatteryPercent()
+                )
+                repository.recordEventsFromReading(readingWithUploaderBattery)
 
-                Log.d(TAG, "Saving glucose reading: ${finalData.value} ${finalData.unit.getDisplayString()}")
-                repository.insertReading(finalData)
+                Log.d(TAG, "Saving glucose reading: ${readingWithUploaderBattery.value} ${readingWithUploaderBattery.unit.getDisplayString()}")
+                repository.insertReading(readingWithUploaderBattery)
 
                 // Notify widget
                 sendBroadcast(Intent(ACTION_GLUCOSE_UPDATE))
@@ -765,6 +761,17 @@ class DiabetesAccessibilityService : AccessibilityService() {
                     Log.d(TAG, "Landscape view exploration completed successfully")
                 }
             }
+        }
+    }
+
+    private fun readUploaderBatteryPercent(): Int? {
+        return try {
+            val batteryManager = getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+            val level = batteryManager.getIntProperty(BatteryManager.BATTERY_PROPERTY_CAPACITY)
+            level.takeIf { it in 0..100 }
+        } catch (e: Exception) {
+            Log.w(TAG, "Companion battery is unavailable", e)
+            null
         }
     }
 
@@ -800,24 +807,20 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
             // Check SAGE
             ageInfo.sensorInfo?.let { sensorInfo ->
-                Log.d(TAG, "SAGE from app: serial=${sensorInfo.serialNumber}, " +
+                Log.d(TAG, "SAGE from CamAPS drawer: " +
                         "startTime=${java.util.Date(sensorInfo.sensorStartTime)}, " +
                         "duration=${sensorInfo.durationText}")
 
-                // Save to preferences for UI display
-                app.preferencesManager.setSensorInfo(sensorInfo.sensorStartTime, sensorInfo.serialNumber)
-
-                val result = app.nightscoutApi.checkAndUpdateSAGE(
-                    appSensorStartTime = sensorInfo.sensorStartTime,
-                    toleranceHours = 1.5,
-                    sensorSerial = sensorInfo.serialNumber
+                // Save only the timestamp for local UI display. The visible
+                // Companion CGM identifier is deliberately not retained.
+                app.preferencesManager.setSensorInfo(sensorInfo.sensorStartTime, null)
+                val observation = ageInfo.observation
+                repository.recordSensorStart(
+                    sensorStartTime = sensorInfo.sensorStartTime,
+                    observedAt = observation?.observedAt ?: System.currentTimeMillis(),
+                    source = observation?.source ?: "camaps_drawer_ocr",
+                    confidence = observation?.confidence ?: 0.8
                 )
-
-                result.onSuccess { status ->
-                    Log.d(TAG, "SAGE check result: $status")
-                }.onFailure { error ->
-                    Log.e(TAG, "SAGE check failed: ${error.message}")
-                }
             }
 
             // Check IAGE
@@ -827,18 +830,18 @@ class DiabetesAccessibilityService : AccessibilityService() {
 
                 // Save to preferences for UI display
                 app.preferencesManager.setInsulinFillTime(insulinInfo.fillTime)
-
-                val result = app.nightscoutApi.checkAndUpdateIAGE(
-                    appFillTime = insulinInfo.fillTime,
-                    toleranceHours = 1.5
+                val observation = ageInfo.observation
+                repository.recordInsulinChange(
+                    fillTime = insulinInfo.fillTime,
+                    observedAt = observation?.observedAt ?: System.currentTimeMillis(),
+                    source = observation?.source ?: "camaps_drawer_ocr",
+                    confidence = observation?.confidence ?: 0.8
                 )
-
-                result.onSuccess { status ->
-                    Log.d(TAG, "IAGE check result: $status")
-                }.onFailure { error ->
-                    Log.e(TAG, "IAGE check failed: ${error.message}")
-                }
             }
+
+            // Flush after both age events have been persisted.  The API uses
+            // stable fingerprints, so this is safe across repeated checks.
+            repository.flushPendingCompanionEvents()
 
             lastSageCheckTime = System.currentTimeMillis()
 

@@ -19,6 +19,7 @@ import java.time.format.DateTimeFormatter
 import java.util.*
 import java.util.concurrent.TimeUnit
 
+@OptIn(kotlinx.serialization.ExperimentalSerializationApi::class)
 class NightscoutApi(private val preferencesManager: PreferencesManager) {
 
     companion object {
@@ -28,6 +29,9 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     private val json = Json {
         ignoreUnknownKeys = true
         encodeDefaults = true
+        // Do not manufacture zero/null fields for values CamAPS did not
+        // expose.  Nocturne can then distinguish unavailable from measured 0.
+        explicitNulls = false
     }
 
     private val client: OkHttpClient by lazy {
@@ -36,19 +40,13 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
             .readTimeout(30, TimeUnit.SECONDS)
             .writeTimeout(30, TimeUnit.SECONDS)
             .addInterceptor(HttpLoggingInterceptor().apply {
-                level = HttpLoggingInterceptor.Level.BODY
+                // Treatment payloads contain health data and API credentials
+                // can appear in request headers.  Keep production logs to
+                // metadata only; failures still include the HTTP status.
+                level = HttpLoggingInterceptor.Level.BASIC
             })
             .build()
     }
-
-    // Store last known values for change detection
-    private var lastBatteryPercent: Int? = null
-    private var lastReservoir: Double? = null
-    
-    // Temp Basal tracking - only upload when rate changes or time expires
-    private var lastBasalRate: Double? = null
-    private var lastBasalUploadTime: Long = 0
-    private val TEMP_BASAL_DURATION_MS = 60 * 60 * 1000L // 60 minutes in milliseconds
 
     // ════════════════════════════════════════════════════════════════════════════
     // Core HTTP Helper - All requests go through here
@@ -78,6 +76,11 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
 
     private fun prepareApiSecret(secret: String): String {
         if (secret.isBlank()) return ""
+
+        // Nocturne direct-grant tokens are opaque `noc_...` values. Nocturne
+        // hashes these raw values server-side (SHA-256); sending a legacy
+        // SHA-1 value here makes an otherwise valid token fail with 401.
+        if (secret.startsWith("noc_")) return secret
 
         // Nightscout tokens (admin-xxx, readable-xxx, etc.) - don't hash
         if (secret.contains("-") && secret.split("-").size == 2) {
@@ -197,74 +200,129 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
 
     suspend fun uploadTreatment(treatment: NightscoutTreatment): Result<String> {
         val body = json.encodeToString(treatment)
-        return post("treatments", body) { "Treatment uploaded" }
-    }
-
-    /**
-     * Upload a Temp Basal treatment to Nightscout
-     * This creates the blue basal line in the Nightscout graph
-     */
-    suspend fun uploadTempBasal(basalRate: Double, timestamp: Long): Result<String> {
-        val treatment = NightscoutTreatment(
-            eventType = "Temp Basal",
-            created_at = formatTimestamp(timestamp),
-            date = timestamp,
-            duration = 60,  // 60 minutes - will be overwritten by next temp basal
-            absolute = basalRate,
-            rate = basalRate,
-            type = "NORMAL"
-        )
-        return uploadTreatment(treatment)
-    }
-
-    /**
-     * Check if Temp Basal needs to be uploaded (rate changed or time expired)
-     * Only uploads when:
-     * 1. Basal rate is present and different from last upload
-     * 2. OR more than 60 minutes since last upload (to refresh the line)
-     */
-    suspend fun checkAndUploadTempBasal(reading: GlucoseReading): Result<String>? {
-        val currentBasalRate = reading.basalRate ?: return null
-        
-        val now = System.currentTimeMillis()
-        val timeSinceLastUpload = now - lastBasalUploadTime
-        val rateChanged = lastBasalRate == null || 
-                          kotlin.math.abs(currentBasalRate - lastBasalRate!!) > 0.001
-        val timeExpired = timeSinceLastUpload >= TEMP_BASAL_DURATION_MS
-        
-        if (rateChanged || timeExpired) {
-            Log.d(TAG, "Uploading Temp Basal: rate=$currentBasalRate, rateChanged=$rateChanged, timeExpired=$timeExpired")
-            val result = uploadTempBasal(currentBasalRate, reading.timestamp)
-            if (result.isSuccess) {
-                lastBasalRate = currentBasalRate
-                lastBasalUploadTime = now
-                Log.d(TAG, "Temp Basal uploaded successfully")
-            } else {
-                Log.e(TAG, "Temp Basal upload failed: ${result.exceptionOrNull()?.message}")
-            }
-            return result
-        } else {
-            Log.d(TAG, "Skipping Temp Basal upload: no change (rate=$currentBasalRate, lastRate=$lastBasalRate)")
-            return null
+        return post("treatments", body) { responseBody ->
+            responseBody.ifBlank { treatment.syncIdentifier ?: "uploaded" }
         }
+    }
+
+    /**
+     * Upload one durable Companion event.  The fingerprint is sent as
+     * `syncIdentifier`, allowing Nocturne to upsert retries and to retain the
+     * original source identity for later Glooko reconciliation.
+     */
+    suspend fun uploadCompanionEvent(event: CompanionEventEntity): Result<String> {
+        val id = event.fingerprint
+        val treatment = when (event.eventType) {
+            CompanionEventEntity.TYPE_BOLUS -> NightscoutTreatment(
+                eventType = "Correction Bolus",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                insulin = event.amount,
+                type = "NORMAL",
+                isBasalInsulin = false,
+                notes = event.notes ?: "Bolus from CamAPS FX (provisional)"
+            )
+            CompanionEventEntity.TYPE_CARB -> NightscoutTreatment(
+                eventType = "Carb Correction",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                carbs = event.carbs,
+                notes = event.notes ?: "Carbohydrates from CamAPS FX (provisional)"
+            )
+            CompanionEventEntity.TYPE_MEAL_BOLUS -> NightscoutTreatment(
+                eventType = "Meal Bolus",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                insulin = event.amount,
+                carbs = event.carbs,
+                type = "NORMAL",
+                isBasalInsulin = false,
+                notes = event.notes ?: "Meal treatment from CamAPS FX (provisional)"
+            )
+            CompanionEventEntity.TYPE_TEMP_BASAL -> NightscoutTreatment(
+                eventType = "Temp Basal",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                duration = event.durationMinutes ?: 60,
+                absolute = event.rate,
+                rate = event.rate,
+                notes = event.notes ?: "Basal-rate change from CamAPS FX (provisional)"
+            )
+            CompanionEventEntity.TYPE_SENSOR_START -> NightscoutTreatment(
+                eventType = "Sensor Start",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                notes = event.notes ?: "Sensor start from CamAPS FX (provisional)"
+            )
+            CompanionEventEntity.TYPE_INSULIN_CHANGE -> NightscoutTreatment(
+                // Nocturne's device-age endpoint recognises the Nightscout
+                // treatment type `Reservoir Change`.  Keep the local event
+                // name `insulin_change`, but use the canonical server type so
+                // IAGE is updated without a second source-specific path.
+                eventType = "Reservoir Change",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                notes = event.notes ?: "Reservoir change from CamAPS FX (provisional)"
+            )
+            CompanionEventEntity.TYPE_SITE_CHANGE -> NightscoutTreatment(
+                eventType = "Site Change",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                notes = event.notes ?: "Site change from CamAPS FX (provisional)"
+            )
+            CompanionEventEntity.TYPE_PUMP_BATTERY_CHANGE -> NightscoutTreatment(
+                eventType = "Pump Battery Change",
+                created_at = formatTimestamp(event.eventTimestamp),
+                syncIdentifier = id,
+                date = event.eventTimestamp,
+                notes = event.notes ?: "Pump battery change from CamAPS FX (provisional)"
+            )
+            else -> return Result.failure(IllegalArgumentException("Unknown Companion event type: ${event.eventType}"))
+        }
+        return uploadTreatment(
+            treatment.copy(notes = annotateCompanionNotes(event, treatment.notes))
+        )
+    }
+
+    private fun annotateCompanionNotes(
+        event: CompanionEventEntity,
+        original: String?
+    ): String {
+        val base = original ?: "Companion FX event"
+        val confidence = String.format(Locale.US, "%.2f", event.confidence.coerceIn(0.0, 1.0))
+        val baseline = if (event.isBaseline) "; baseline=true" else ""
+        val correlation = event.correlationKey?.let { "; correlation=$it" } ?: ""
+        val confirmation = if (event.confirmationState != CompanionEventEntity.CONFIRMATION_NOT_REQUIRED) {
+            "; confirmation=${event.confirmationState}"
+        } else {
+            ""
+        }
+        return "$base [source=${event.source}; confidence=$confidence$baseline$correlation$confirmation]"
     }
 
     suspend fun uploadReadingWithExtras(reading: GlucoseReading): Result<String> =
         withContext(Dispatchers.IO) {
             try {
+                // Preserve the original Companion FX contract: upload the
+                // screen reading and the CamAPS device status. Treatment and
+                // device-change rows are now flushed separately from the
+                // durable Room ledger so retries cannot duplicate them.
                 val readingResult = uploadReading(reading)
                 if (readingResult.isFailure) {
                     return@withContext readingResult
                 }
-
-                uploadDeviceStatus(reading)
-                detectAndUploadEvents(reading)
-                
-                // Upload Temp Basal as treatment (for blue basal line in graph)
-                // Only uploads when rate changes or time expires
-                checkAndUploadTempBasal(reading)
-
-                Result.success("Reading, device status, and events uploaded")
+                val statusResult = uploadDeviceStatus(reading)
+                if (statusResult.isFailure) {
+                    return@withContext statusResult
+                }
+                Result.success("Reading and device status uploaded")
             } catch (e: Exception) {
                 Result.failure(e)
             }
@@ -313,16 +371,20 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
      * @param sensorStartTime The timestamp when the sensor was inserted (in milliseconds)
      * @param sensorSerial Optional sensor serial number
      */
+    @Suppress("UNUSED_PARAMETER")
     suspend fun uploadSensorStart(sensorStartTime: Long, sensorSerial: String? = null): Result<String> {
         val treatment = NightscoutTreatment(
             eventType = "Sensor Start",
             created_at = formatTimestamp(sensorStartTime),
+            syncIdentifier = "companionfx:sensor-start:$sensorStartTime",
             date = sensorStartTime,
             device = "loop://CamAPSFX-ScreenReader",
             app = "AndroidAPS",
             enteredBy = "CamAPSFX-ScreenReader",
             isValid = true,
-            notes = sensorSerial?.let { "Freestyle Libre 3 Plus - $it" } ?: "Sensor von CamAPS FX"
+            // Sensor identifiers are not needed for device age and must never
+            // be copied into Nocturne notes or public source artifacts.
+            notes = "Sensor from CamAPS FX"
         )
         val body = json.encodeToString(treatment)
         return post("treatments", body) { "Sensor Start uploaded" }
@@ -427,14 +489,15 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
      */
     suspend fun uploadInsulinChange(fillTime: Long): Result<String> {
         val treatment = NightscoutTreatment(
-            eventType = "Insulin Change",
+            eventType = "Reservoir Change",
             created_at = formatTimestamp(fillTime),
+            syncIdentifier = "companionfx:insulin-change:$fillTime",
             date = fillTime,
             device = "loop://CamAPSFX-ScreenReader",
             app = "AndroidAPS",
             enteredBy = "CamAPSFX-ScreenReader",
             isValid = true,
-            notes = "Reservoir gefüllt"
+            notes = "Reservoir refill from CamAPS FX"
         )
         val body = json.encodeToString(treatment)
         return post("treatments", body) { "Insulin Change uploaded" }
@@ -481,58 +544,6 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
     }
 
     // ════════════════════════════════════════════════════════════════════════════
-    // Event Detection
-    // ════════════════════════════════════════════════════════════════════════════
-
-    suspend fun detectAndUploadEvents(reading: GlucoseReading): Result<List<String>> =
-        withContext(Dispatchers.IO) {
-            val uploadedEvents = mutableListOf<String>()
-
-            try {
-                // Detect battery change (higher value than before = new battery)
-                reading.pumpBattery?.let { current ->
-                    lastBatteryPercent?.let { last ->
-                        if (current > last + 10) {
-                            uploadTreatment(createTreatment(
-                                reading, "Pump Battery Change",
-                                "Batterie gewechselt: $last% → $current%"
-                            ))
-                            uploadedEvents.add("Battery change detected")
-                        }
-                    }
-                    lastBatteryPercent = current
-                }
-
-                // Detect reservoir change (higher value = refilled)
-                reading.reservoir?.let { current ->
-                    lastReservoir?.let { last ->
-                        if (current > last + 50) {
-                            uploadTreatment(createTreatment(
-                                reading, "Insulin Change",
-                                "Reservoir gewechselt: ${last.toInt()} IE → ${current.toInt()} IE"
-                            ))
-                            uploadedEvents.add("Reservoir change detected")
-                        }
-                    }
-                    lastReservoir = current
-                }
-
-                // Upload recent bolus (< 5 min ago)
-                reading.bolusAmount?.let { amount ->
-                    if (amount > 0 && reading.bolusMinutesAgo != null && reading.bolusMinutesAgo < 5) {
-                        val bolusTime = reading.timestamp - (reading.bolusMinutesAgo * 60 * 1000).toLong()
-                        uploadTreatment(createBolusTreatment(bolusTime, amount))
-                        uploadedEvents.add("Bolus uploaded: $amount IE")
-                    }
-                }
-
-                Result.success(uploadedEvents)
-            } catch (e: Exception) {
-                Result.failure(e)
-            }
-        }
-
-    // ════════════════════════════════════════════════════════════════════════════
     // Data Converters
     // ════════════════════════════════════════════════════════════════════════════
 
@@ -557,24 +568,24 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
             device = "loop://CamAPSFX-ScreenReader",
             created_at = ts,
             date = timestamp,
-            uploaderBattery = 100,
+            uploaderBattery = uploaderBattery,
             isCharging = null,
-            uploader = UploaderInfo(battery = 100),
+            uploader = UploaderInfo(battery = uploaderBattery),
             pump = PumpStatus(
                 clock = ts,
                 battery = pumpBattery?.let { PumpBattery(percent = it, voltage = null) },
                 reservoir = reservoir,
-                status = PumpStatusInfo(status = "normal", timestamp = ts)
+                status = PumpStatusInfo(status = null, timestamp = ts)
             ),
             openaps = OpenAPSStatus(
-                iob = activeInsulin?.let { OpenAPSIOB(iob = it, basaliob = null, bolusiob = it, timestamp = ts) },
+                iob = activeInsulin?.let { OpenAPSIOB(iob = it, basaliob = null, bolusiob = null, timestamp = ts) },
                 suggested = basalRate?.let { rate ->
                     OpenAPSSuggested(
                         temp = "absolute",
                         bg = getValueInUnit(GlucoseUnit.MG_DL).toInt(),
                         tick = trend.toDirection(),
                         eventualBG = null,
-                        insulinReq = 0.0,
+                        insulinReq = null,
                         rate = rate,
                         duration = 30,
                         timestamp = ts,
@@ -632,6 +643,7 @@ class NightscoutApi(private val preferencesManager: PreferencesManager) {
         val treatment = NightscoutTreatment(
             eventType = "Meal Bolus",
             created_at = formatTimestamp(timestamp),
+            syncIdentifier = "companionfx:meal:$timestamp:$carbsGrams",
             date = timestamp,
             device = "loop://CamAPSFX-ScreenReader",
             app = "AndroidAPS",

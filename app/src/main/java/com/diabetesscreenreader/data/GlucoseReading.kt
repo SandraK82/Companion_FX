@@ -3,6 +3,7 @@ package com.diabetesscreenreader.data
 import androidx.room.Entity
 import androidx.room.PrimaryKey
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerialName
 
 @Entity(tableName = "glucose_readings")
 data class GlucoseReading(
@@ -21,6 +22,7 @@ data class GlucoseReading(
     val basalRate: Double? = null, // IE/h
     val reservoir: Double? = null, // IE
     val pumpBattery: Int? = null, // %
+    val uploaderBattery: Int? = null, // companion phone battery %
     val bolusAmount: Double? = null, // IE
     val bolusMinutesAgo: Int? = null,
     val pumpConnectionMinutesAgo: Int? = null,
@@ -68,13 +70,13 @@ enum class GlucoseUnit {
 
 enum class GlucoseTrend(val arrow: String, val description: String) {
     DOUBLE_UP("↑↑", "Stark steigend"),
-    SINGLE_UP("↑", "Steigend"),
+    SINGLE_UP("↑", "Rising"),
     FORTY_FIVE_UP("↗", "Leicht steigend"),
-    FLAT("→", "Stabil"),
+    FLAT("→", "Stable"),
     FORTY_FIVE_DOWN("↘", "Leicht fallend"),
-    SINGLE_DOWN("↓", "Fallend"),
+    SINGLE_DOWN("↓", "Falling"),
     DOUBLE_DOWN("↓↓", "Stark fallend"),
-    UNKNOWN("?", "Unbekannt");
+    UNKNOWN("?", "Unknown");
 
     companion object {
         fun fromString(value: String): GlucoseTrend {
@@ -134,7 +136,7 @@ data class NightscoutDeviceStatus(
 
 @Serializable
 data class UploaderInfo(
-    val battery: Int?
+    val battery: Int? = null
 )
 
 @Serializable
@@ -153,7 +155,7 @@ data class PumpBattery(
 
 @Serializable
 data class PumpStatusInfo(
-    val status: String = "normal",
+    val status: String? = null,
     val timestamp: String
 )
 
@@ -192,7 +194,7 @@ data class OpenAPSEnacted(
 data class OpenAPSIOB(
     val iob: Double,
     val basaliob: Double? = null,
-    val bolusiob: Double,
+    val bolusiob: Double? = null,
     val timestamp: String
 )
 
@@ -200,12 +202,19 @@ data class OpenAPSIOB(
 data class NightscoutTreatment(
     val eventType: String,
     val created_at: String,
+    // Stable source identifier used by Nocturne/Nightscout for idempotent
+    // upserts.  Retries and phone restarts reuse the same value.
+    val syncIdentifier: String? = null,
+    // Nocturne's legacy treatment endpoint uses this explicit source field as
+    // the first half of its (data source, sync identifier) upsert key.
+    @SerialName("data_source")
+    val dataSource: String = "companion-fx",
     val date: Long? = null,
     val device: String = "loop://CamAPSFX-ScreenReader",
-    val app: String = "AndroidAPS",
+    val app: String = "Companion FX",
     val isValid: Boolean = true,
     val isReadOnly: Boolean = false,
-    val enteredBy: String = "CamAPSFX-ScreenReader",
+    val enteredBy: String = "companion-fx",
     val notes: String? = null,
     val insulin: Double? = null,
     val type: String? = null, // For bolus: "NORMAL", "SMB", "PRIMING"

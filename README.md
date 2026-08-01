@@ -14,6 +14,26 @@ Companion app for CamAPS FX that reads glucose values from the screen and upload
 - **Home Screen Widget**: Displays current glucose value and trend graph
 - **Multi-Language**: Supports German, English, and French CamAPS FX versions
 
+### Reliability and privacy behavior
+
+- Treatment and device changes are written to a durable Room event ledger before
+  any network request. Stable fingerprints, retry state, and explicit Room
+  migrations prevent a repeated screen read or a failed request from creating
+  duplicate Nightscout treatments or erasing the local queue.
+- The CamAPS drawer parser accepts accessibility text first and uses in-memory
+  screenshot OCR when the custom-rendered age values are not exposed to the
+  accessibility tree. It recognizes the English, German, and French labels for
+  sensor insertion, reservoir refill, and sensor expiry.
+- The first observation of the currently active sensor or reservoir is marked as
+  a baseline. It can populate device-age information, but downstream inventory
+  tools can ignore it when counting new supplies.
+- OCR screenshots are not written to disk and OCR text is not uploaded. Only
+  sanitized timestamps, event type, source, confidence, and stable event IDs
+  are sent with treatment records.
+- The background reader wakes the display only for a short read and does not
+  force-lock the phone afterwards. If Android denies exact-alarm access, the
+  service falls back to an inexact idle-aware alarm instead of crashing.
+
 ## Installation
 
 1. Download and install the APK
